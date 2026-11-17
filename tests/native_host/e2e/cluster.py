@@ -1207,9 +1207,8 @@ class SpurCluster:
             if "Gres=" not in line:
                 continue
             gres = line.split("Gres=", 1)[1].strip()
-            if not gres:
-                return 0
-            return len(re.findall(r"gpu:[^,]+", gres))
+            # One `gpu[:type]:count` entry per GPU type.
+            return sum(int(n) for n in re.findall(r"(?:^|,)gpu:(?:[^,:]+:)?(\d+)", gres))
         return 0
 
     def assert_sinfo_gpus(self, min_per_node: int = 1):

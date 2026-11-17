@@ -350,6 +350,11 @@ PARTITION STATE CPUS MEMORY GRES``.
    sinfo -N -o "%N %.6D %.11T %c %m %G"
    sinfo -p gpu -l
 
+The ``GRES`` column (``%G``), like ``Gres=`` in ``scontrol show node``, lists one
+``name[:type]:count`` entry per device kind, then each countable pool, for
+example ``gpu:mi300x:8,nic:pollara400:8,bandwidth:lustre:4096``. A node with
+none shows ``(null)``.
+
 ``-R`` / ``--list-reasons`` lists only nodes that are unavailable (``down``,
 ``drain``, ``drng``, ``err``), grouped by the admin reason set when the node was
 drained or downed, one row per reason with a compressed nodelist:

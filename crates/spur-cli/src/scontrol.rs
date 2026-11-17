@@ -764,15 +764,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     total.map(|r| r.memory_mb).unwrap_or(0),
                     node.free_memory_mb,
                 );
-                let gpu_types: Vec<String> = total
-                    .map(|r| r.devices.as_slice())
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|d| d.gres_name == "gpu")
-                    .map(|g| format!("gpu:{}:1", g.device_type))
-                    .collect();
-                if !gpu_types.is_empty() {
-                    println!("   Gres={}", gpu_types.join(","));
+                let gres = total.map(crate::gres_fmt::node_gres).unwrap_or_default();
+                if !gres.is_empty() {
+                    println!("   Gres={}", gres.join(","));
                 }
                 if let Some(resources) = total {
                     println!(
