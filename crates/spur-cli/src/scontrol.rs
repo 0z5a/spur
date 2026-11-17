@@ -776,7 +776,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     if let Some(revision) = &resources.block_file_revision {
                         println!("   BlockFileRevision={revision}");
                     }
-                    for gpu in resources.devices.iter().filter(|d| d.gres_name == "gpu") {
+                    for gpu in crate::gres_fmt::node_devices(resources)
+                        .iter()
+                        .filter(|d| d.gres_name == "gpu")
+                    {
                         print!("{}", format_gpu_topology(gpu));
                     }
                 }
