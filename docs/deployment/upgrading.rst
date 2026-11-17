@@ -1185,13 +1185,21 @@ Node inventory now lists every allocatable device, of every kind, in
   working, but it will be removed in a future release. Read ``devices``.
   ``GpuResource.peer_gpus`` is now always empty and ``link_type`` always PCIe;
   ``memory_mb`` is derived from the device's VRAM (``topology.vram_bytes``).
+* **Deprecated: ``RegisterJobAllocationRequest.gpu_devices``.** Still filled
+  for this release; read ``allocated``.
 * **Raft log and snapshots.** A controller reads node inventories written by
   earlier releases, and keeps writing the old ``gpus`` list next to
   ``devices``, so you can roll back to the previous release.
 * **Agent state files.** An upgraded ``spurd`` reads the
   ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
   wrote. After a rollback, an older ``spurd`` ignores fences the newer one
-  wrote, as it would an unreadable file.
+  wrote, as it would an unreadable file. Supervisors of running jobs keep
+  working across the upgrade and a rollback: their state still records the
+  job's GPUs in the old form.
+* **File-backed GRES of any kind are schedulable.** A ``[[devices.gres]]``
+  entry with ``file`` and a name other than ``gpu`` was never reported, so jobs
+  requesting it could not run. It is now reported, allocated per device, and
+  injected like a GPU.
 * **Hook ``SPUR_JOB_GPUS`` is positional.** Prolog and epilog hooks now see
   the same 0-based GPU indices as the job's ``SPUR_JOB_GPUS`` and
   ``ROCR_VISIBLE_DEVICES``. Earlier releases passed internal device ids
