@@ -55,8 +55,6 @@ pub struct StepdLaunchSpec {
     #[serde(default)]
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     #[serde(default)]
-    pub node_allocates_rdma: bool,
-    #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
     #[serde(default)]
     pub hooks: spur_core::config::HooksConfig,
@@ -164,6 +162,9 @@ pub struct StepdJobResources {
     pub devices: spur_devices::DeviceSelection,
     /// Positional index of each held GPU, for hooks run after an agent restart.
     pub gpu_indices: Vec<u32>,
+    /// RDMA nodes withheld unless allocated, fixed when the job started so its
+    /// later steps get the same device access.
+    pub gated_rdma: Vec<String>,
     /// The exact cores, so a restart replays the binding the job is pinned to
     /// instead of re-deriving one that overlaps it.
     pub cpu_ids: Vec<u32>,
@@ -194,6 +195,8 @@ struct StepdJobResourcesRepr {
     #[serde(default)]
     gpu_indices: Vec<u32>,
     #[serde(default)]
+    gated_rdma: Vec<String>,
+    #[serde(default)]
     cpu_ids: Vec<u32>,
     #[serde(default)]
     partition: String,
@@ -218,6 +221,7 @@ impl From<StepdJobResourcesRepr> for StepdJobResources {
             memory_mb: raw.memory_mb,
             devices,
             gpu_indices: raw.gpu_indices,
+            gated_rdma: raw.gated_rdma,
             cpu_ids: raw.cpu_ids,
             partition: raw.partition,
             nodelist: raw.nodelist,
@@ -237,6 +241,7 @@ impl From<StepdJobResources> for StepdJobResourcesRepr {
             gpu_devices: r.devices.gpus().to_vec(),
             devices: r.devices,
             gpu_indices: r.gpu_indices,
+            gated_rdma: r.gated_rdma,
             cpu_ids: r.cpu_ids,
             partition: r.partition,
             nodelist: r.nodelist,
@@ -278,7 +283,6 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             io_mode: config.io_mode,
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
-            node_allocates_rdma: config.node_allocates_rdma,
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
             plugstack_path: String::new(),
@@ -301,6 +305,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 memory_mb: config.memory_mb,
                 devices: config.devices.clone(),
                 gpu_indices: crate::executor::hook_gpu_indices(config.host_device_plan.as_ref()),
+                gated_rdma: config.gated_rdma.clone(),
                 cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
@@ -349,7 +354,7 @@ impl StepdLaunchSpec {
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
-            node_allocates_rdma: self.node_allocates_rdma,
+            gated_rdma: self.resources.gated_rdma.clone(),
             memlock: self.memlock.into(),
             io_mode: self.io_mode,
             pmix_multi_task: self.pmix_multi_task,
@@ -4140,6 +4145,7 @@ mod device_state_compat {
                 .with("gpu", vec![0x110000])
                 .with("nic", vec![0x050000]),
             gpu_indices: vec![0],
+            gated_rdma: vec!["/dev/infiniband/uverbs0".into()],
             ..Default::default()
         }
     }
@@ -4164,6 +4170,10 @@ mod device_state_compat {
             serde_json::from_str(FROZEN_GPU_DESCRIPTOR_JSON).expect("older descriptor.json");
 
         assert_eq!(d.resources.devices.gpus(), &[0x110000, 0x120000]);
+        assert!(
+            d.resources.gated_rdma.is_empty(),
+            "a job started before RDMA gating keeps RDMA open"
+        );
         let binding = d
             .resources
             .gpu_binding
@@ -4606,7 +4616,6 @@ mod tests {
             io_mode: crate::executor::LaunchIo::File,
             container: None,
             host_device_plan: None,
-            node_allocates_rdma: false,
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
             plugstack_path: String::new(),
@@ -4646,11 +4655,14 @@ mod tests {
     #[test]
     fn a_relaunched_supervisor_keeps_withholding_rdma() {
         let mut config = launch_spec().into_launch_config();
-        config.node_allocates_rdma = true;
+        config.gated_rdma = vec!["/dev/infiniband/uverbs0".to_string()];
         let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
         let persisted: StepdLaunchSpec =
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert!(persisted.into_launch_config().node_allocates_rdma);
+        assert_eq!(
+            persisted.into_launch_config().gated_rdma,
+            ["/dev/infiniband/uverbs0"]
+        );
     }
 
     #[test]
@@ -4978,7 +4990,6 @@ mod tests {
             "gpu_devices",
             "container",
             "host_device_plan",
-            "node_allocates_rdma",
             "container_rootfs_mode",
             "hooks",
             "plugstack_path",
@@ -5000,10 +5011,6 @@ mod tests {
         assert!(restored.resources.devices.is_empty());
         assert!(restored.container.is_none());
         assert!(restored.host_device_plan.is_none());
-        assert!(
-            !restored.node_allocates_rdma,
-            "a job launched before the field keeps RDMA open"
-        );
         assert!(restored.container_rootfs_mode.is_none());
         assert_eq!(
             serde_json::to_value(&restored.hooks).expect("encode default hooks"),

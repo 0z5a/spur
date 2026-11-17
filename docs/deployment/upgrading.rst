@@ -1156,13 +1156,14 @@ RDMA device access on AI NIC nodes (``constrain_rdma_devices``)
 
 Spur now discovers AMD Pollara AI NICs and schedules them per job
 (:doc:`/admin-guide/ai-nics`). On a node that hands out RDMA devices per job, a
-job can open only the RDMA devices it was allocated, plus ``rdma_cm``. This
-covers a node with Pollara NICs and ``auto_detect`` on, and a node with a
-``[[devices.gres]]`` entry whose files are under ``/dev/infiniband/``.
+job can open those devices only if they are allocated to it. This covers a node
+with Pollara NICs and ``auto_detect`` on, and a node with a ``[[devices.gres]]``
+entry whose files are under ``/dev/infiniband/``. RDMA nodes Spur does not
+allocate, such as ``rdma_cm`` or another vendor's HCA, stay open.
 
-**Effect:** a job on such a node that uses RDMA without requesting NICs, for
-example MPI over verbs, now fails to open ``/dev/infiniband/uverbsN`` with
-``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
+**Effect:** a job on such a node that uses those NICs without requesting them,
+for example MPI over verbs, now fails to open their ``/dev/infiniband/uverbsN``
+with ``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
 as before:
 
 .. code-block:: toml
