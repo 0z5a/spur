@@ -112,8 +112,9 @@ and countable pools (count-only, no device paths).
 
 `DeviceEntry` (entry.rs) carries all scheduling-relevant fields:
 gres_name, kind, device_id, stable_id, capability (Injectable vs
-CountablePool), memory_mb, numa_node, cores, links, link_type, pci_bdf,
-vendor, inject_actions, device/shared edits.
+CountablePool), memory_mb, links, link_type, pci_bdf, topology,
+vendor, inject_actions, device/shared edits. `node_paths()` yields the
+device's own node paths (not its kind's shared ones).
 
 `resolve_by_ids()` looks up devices by stable_id (not positional
 device_id). Returns error if any ID is missing.
