@@ -45,8 +45,7 @@ impl DeviceRegistry {
             candidates.push(countable_pool_entry(pool));
         }
 
-        // Dedup only catches exact device path matches. CDI is filled first, so it wins.
-        // If autodetect is on and GRES also lists the same GPUs, that's a config mistake we don't fix.
+        // CDI is filled first, so it wins over GRES naming the same device.
         self.devices = dedup_by_device_paths(candidates);
         assign_device_ids(&mut self.devices);
     }
@@ -226,7 +225,14 @@ fn dedup_by_device_paths(candidates: Vec<DeviceEntry>) -> Vec<DeviceEntry> {
             continue;
         }
 
-        if let Some((_, existing_kind)) = seen.iter().find(|(p, _)| *p == per_device_paths) {
+        // One entry's nodes covering the other's is one device described twice
+        // (GRES names the render node, CDI adds the card); partitions that only
+        // share a card node each keep their own render node, so stay distinct.
+        let is_subset = |a: &[String], b: &[String]| a.iter().all(|p| b.contains(p));
+        if let Some((_, existing_kind)) = seen
+            .iter()
+            .find(|(p, _)| is_subset(p, &per_device_paths) || is_subset(&per_device_paths, p))
+        {
             warn!(
                 duplicate_kind = %entry.kind,
                 existing_kind = %existing_kind,
@@ -1173,6 +1179,71 @@ mod tests {
             .inject_actions
             .gpu_visibility_vars
             .contains("ROCR_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn a_gres_gpu_naming_part_of_a_cdi_gpu_is_the_same_gpu() {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: ["128", "129"]
+                .iter()
+                .enumerate()
+                .map(|(i, minor)| CdiDevice {
+                    name: i.to_string(),
+                    annotations: Default::default(),
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![
+                            node(&format!("/dev/dri/renderD{minor}")),
+                            node(&format!("/dev/dri/card{}", i + 1)),
+                        ],
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            container_edits: None,
+        }]);
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD[128-129]".into()),
+            ..Default::default()
+        }];
+
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &gres);
+        let kinds: Vec<&str> = reg.list().iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["amd.com/gpu", "amd.com/gpu"]);
+    }
+
+    #[test]
+    fn partitions_sharing_a_card_node_stay_distinct() {
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: ["128", "129"]
+                .iter()
+                .enumerate()
+                .map(|(i, minor)| CdiDevice {
+                    name: i.to_string(),
+                    annotations: Default::default(),
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![
+                            node(&format!("/dev/dri/renderD{minor}")),
+                            node("/dev/dri/card1"),
+                        ],
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            container_edits: None,
+        }]);
+        let mut reg = DeviceRegistry::new();
+        populate_registry(&mut reg, &cache, &[]);
+        assert_eq!(reg.injectable_count(), 2);
     }
 
     #[test]
