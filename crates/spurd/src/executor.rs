@@ -196,6 +196,9 @@ pub struct JobLaunchConfig {
     pub mpi: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
+    /// The node grants RDMA device nodes by allocation, so `[cgroup]` may
+    /// withhold the ones this job was not given.
+    pub node_allocates_rdma: bool,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
     /// cgroup-v2 enforcement settings from `[cgroup]`.
@@ -630,7 +633,10 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let device_paths = allocated_device_paths(cfg.host_device_plan.as_ref());
+    let devices = device_cgroup::JobDevices {
+        allocated: allocated_device_paths(cfg.host_device_plan.as_ref()),
+        node_allocates_rdma: cfg.node_allocates_rdma,
+    };
     let cgroup_path = CgroupGuard(setup_cgroup(
         CgroupScope {
             job_id,
@@ -641,7 +647,7 @@ async fn spawn_job_process(
         cpus,
         memory_mb,
         cpu_ids,
-        device_paths,
+        devices,
         &cfg.step_limits,
     )?);
 
@@ -1176,7 +1182,7 @@ fn apply_step_limits(
     step_path: &Path,
     cgroup: &CgroupConfig,
     step: &StepLimits,
-    device_paths: &[String],
+    devices: device_cgroup::JobDevices,
 ) -> anyhow::Result<()> {
     let applied = (|| -> anyhow::Result<()> {
         for (name, content) in step_limit_files(cgroup, step) {
@@ -1186,8 +1192,7 @@ fn apply_step_limits(
         // The job's filter stays attached above and the kernel requires both to
         // allow an open, so this can only take devices away from the step.
         if step.gpus.is_some() {
-            let paths =
-                device_cgroup::device_paths_for_job(device_paths, &cgroup.extra_device_paths);
+            let paths = device_cgroup::device_paths_for_job(cgroup, devices);
             let rules =
                 device_cgroup::rules_for_device_paths(&paths, device_cgroup::stat_device_node);
             device_cgroup::install_device_filter(step_path, &rules)?;
@@ -1309,7 +1314,7 @@ pub(crate) fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
-    device_paths: &[String],
+    devices: device_cgroup::JobDevices,
     step_limits: &StepLimits,
 ) -> anyhow::Result<Option<PathBuf>> {
     let CgroupScope {
@@ -1341,7 +1346,7 @@ pub(crate) fn setup_cgroup(
                 "[cgroup] the step asked for its own limits but has no cgroup of its own"
             );
         }
-        apply_step_limits(&step_path, cgroup, step_limits, device_paths)?;
+        apply_step_limits(&step_path, cgroup, step_limits, devices)?;
         return Ok(joined);
     }
 
@@ -1448,7 +1453,7 @@ pub(crate) fn setup_cgroup(
     // Attach before any of the job's processes join: the filter is consulted at
     // open(2), so a device a process already holds open stays readable regardless.
     if cgroup.constrain_devices {
-        let paths = device_cgroup::device_paths_for_job(device_paths, &cgroup.extra_device_paths);
+        let paths = device_cgroup::device_paths_for_job(cgroup, devices);
         let rules = device_cgroup::rules_for_device_paths(&paths, device_cgroup::stat_device_node);
         if let Err(e) = device_cgroup::install_device_filter(&cgroup_path, &rules) {
             warn!(job_id, error = %e, "device filter not installed; job runs without device isolation");
@@ -3158,10 +3163,19 @@ mod step_limit_files_tests {
             memory_mb: Some(64),
             ..Default::default()
         };
-        let err = setup_cgroup(scope, &disabled, 1, 0, &[], &[], &step).unwrap_err();
+        let err = setup_cgroup(scope, &disabled, 1, 0, &[], Default::default(), &step).unwrap_err();
         assert!(err.to_string().contains("cgroups are disabled"), "{err}");
         assert_eq!(
-            setup_cgroup(scope, &disabled, 1, 0, &[], &[], &StepLimits::default()).unwrap(),
+            setup_cgroup(
+                scope,
+                &disabled,
+                1,
+                0,
+                &[],
+                Default::default(),
+                &StepLimits::default()
+            )
+            .unwrap(),
             None,
             "a step without limits of its own still runs unconfined"
         );
@@ -4437,6 +4451,7 @@ mod tests {
             partition: String::new(),
             nodelist: String::new(),
             host_device_plan: None,
+            node_allocates_rdma: false,
             memlock: MemlockLimit::Unlimited,
             cgroup: CgroupConfig::default(),
             io_mode: LaunchIo::File,

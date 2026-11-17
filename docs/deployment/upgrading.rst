@@ -1151,6 +1151,28 @@ change, so add the field after every controller is upgraded. Restarts and agent
 registrations never write it. A rollback after the entry has been written is not
 supported because older controllers cannot replay it: roll forward.
 
+RDMA device access on AI NIC nodes (``constrain_rdma_devices``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur now discovers AMD Pollara AI NICs and schedules them per job
+(:doc:`/admin-guide/ai-nics`). On a node that hands out RDMA devices per job, a
+job can open only the RDMA devices it was allocated, plus ``rdma_cm``. This
+covers a node with Pollara NICs and ``auto_detect`` on, and a node with a
+``[[devices.gres]]`` entry whose files are under ``/dev/infiniband/``.
+
+**Effect:** a job on such a node that uses RDMA without requesting NICs, for
+example MPI over verbs, now fails to open ``/dev/infiniband/uverbsN`` with
+``EPERM``. Add ``--gres=nic:N`` to those jobs. To keep RDMA open to every job,
+as before:
+
+.. code-block:: toml
+
+   [cgroup]
+   constrain_rdma_devices = false
+
+Other nodes are not affected. Jobs already running when ``spurd`` is upgraded
+keep the access they started with.
+
 Generic device inventory
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
