@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 pub use spur_devices::topology::DeviceTopology;
 use std::collections::{BTreeMap, HashMap};
 
-/// GPU interconnect type.
+use crate::device::{Device, LegacyGpu, GPU_GRES};
+
+/// GPU interconnect type. Survives only on the deprecated GPU-only wire and
+/// serde shapes, which still carry it for older readers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GpuLinkType {
     PCIe,
@@ -13,52 +16,110 @@ pub enum GpuLinkType {
     NVLink,
 }
 
-/// A single GPU resource.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GpuResource {
-    pub device_id: u32,
-    pub gpu_type: String,
-    pub memory_mb: u64,
-    pub peer_gpus: Vec<u32>,
-    pub link_type: GpuLinkType,
-    /// Stable per-logical-device identity: BDF(domain:bus:dev.func) + partition
-    /// rank. Unlike `device_id` (a positional visible index for injection), this
-    /// survives a mid-set removal without renumbering, so allocation accounting
-    /// keys on it.
-    #[serde(default)]
-    pub stable_id: u64,
-    #[serde(default)]
-    pub topology: Option<DeviceTopology>,
-}
-
 /// A set of compute resources (node-level inventory).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// Serialized through [`ResourceSetIn`]/[`ResourceSetOut`]: besides `devices` it
+/// still writes the deprecated GPU-only `gpus` list, so a controller rolled back
+/// to the previous release can replay the log, and reads `gpus` from entries an
+/// older build wrote.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(from = "ResourceSetIn")]
 pub struct ResourceSet {
     pub cpus: u32,
     pub memory_mb: u64,
-    pub gpus: Vec<GpuResource>,
+    /// Every allocatable device on the node, of every kind (GPUs, NICs, ...).
+    pub devices: Vec<Device>,
     pub generic: HashMap<String, u64>,
     /// Bumped by the agent on every topology rebuild. An allocation records the
     /// generation it was made under; a repartition that reuses a stable_id value
     /// for a different logical device is caught by a generation mismatch.
-    #[serde(default)]
     pub generation: u64,
     /// Shared monotonic capability: native fabric = 1, file = 2, GPU properties = 3.
-    #[serde(default)]
     pub fabric_binding_version: u32,
-    #[serde(default)]
     pub block_file_revision: Option<String>,
     /// Agent-reported CPU topology. Belongs in a node's raw report
     /// (`detected_resources`); `clamped` drops it when deriving schedulable
     /// resources from that report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<crate::cpu_topology::CpuTopology>,
+}
+
+#[derive(Deserialize)]
+struct ResourceSetIn {
+    cpus: u32,
+    memory_mb: u64,
+    #[serde(default)]
+    devices: Vec<Device>,
+    /// Deprecated: an older build's GPU-only list, read only when `devices` is absent.
+    #[serde(default)]
+    gpus: Vec<Device>,
+    #[serde(default)]
+    generic: HashMap<String, u64>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    fabric_binding_version: u32,
+    #[serde(default)]
+    block_file_revision: Option<String>,
+    #[serde(default)]
+    topology: Option<crate::cpu_topology::CpuTopology>,
+}
+
+impl From<ResourceSetIn> for ResourceSet {
+    fn from(raw: ResourceSetIn) -> Self {
+        let devices = if raw.devices.is_empty() {
+            raw.gpus
+        } else {
+            raw.devices
+        };
+        Self {
+            cpus: raw.cpus,
+            memory_mb: raw.memory_mb,
+            devices,
+            generic: raw.generic,
+            generation: raw.generation,
+            fabric_binding_version: raw.fabric_binding_version,
+            block_file_revision: raw.block_file_revision,
+            topology: raw.topology,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResourceSetOut<'a> {
+    cpus: u32,
+    memory_mb: u64,
+    devices: &'a [Device],
+    /// Deprecated, still written for one release: see [`ResourceSet`].
+    gpus: Vec<LegacyGpu>,
+    generic: &'a HashMap<String, u64>,
+    generation: u64,
+    fabric_binding_version: u32,
+    block_file_revision: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology: &'a Option<crate::cpu_topology::CpuTopology>,
+}
+
+impl Serialize for ResourceSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ResourceSetOut {
+            cpus: self.cpus,
+            memory_mb: self.memory_mb,
+            devices: &self.devices,
+            gpus: self.gpus().map(LegacyGpu::from).collect(),
+            generic: &self.generic,
+            generation: self.generation,
+            fabric_binding_version: self.fabric_binding_version,
+            block_file_revision: &self.block_file_revision,
+            topology: &self.topology,
+        }
+        .serialize(serializer)
+    }
 }
 
 pub type InventoryFingerprint = (
     u32,
     u64,
-    Vec<GpuResource>,
+    Vec<Device>,
     Vec<(String, u64)>,
     u32,
     Option<String>,
@@ -135,28 +196,16 @@ impl ResourceAllocations {
         let Some(devs) = self.devices.get(gres_name) else {
             return 0;
         };
-        if gres_name == "gpu" {
-            devs.iter()
-                .filter(|d| {
-                    if let Some(gtype) = device_type {
-                        if gtype == "any" {
-                            return true;
-                        }
-                        inventory
-                            .gpus
-                            .iter()
-                            .find(|g| g.stable_id == d.device_id)
-                            .map(|g| g.gpu_type.as_str())
-                            == Some(gtype)
-                    } else {
-                        true
-                    }
-                })
-                .map(|d| d.count as u32)
-                .sum()
-        } else {
-            devs.iter().map(|d| d.count as u32).sum()
-        }
+        devs.iter()
+            .filter(|d| match device_type {
+                None | Some("any") => true,
+                Some(t) => inventory
+                    .devices_of(gres_name)
+                    .find(|inv| inv.stable_id == d.device_id)
+                    .is_none_or(|inv| inv.device_type == t),
+            })
+            .map(|d| d.count as u32)
+            .sum()
     }
 
     pub fn generic_count(&self, name: &str) -> u64 {
@@ -291,12 +340,26 @@ impl ResourceRequest {
 }
 
 impl ResourceSet {
+    pub fn devices_of<'a>(&'a self, gres_name: &'a str) -> impl Iterator<Item = &'a Device> {
+        self.devices
+            .iter()
+            .filter(move |d| d.gres_name == gres_name)
+    }
+
+    pub fn gpus(&self) -> impl Iterator<Item = &Device> {
+        self.devices_of(GPU_GRES)
+    }
+
+    pub fn gpus_mut(&mut self) -> impl Iterator<Item = &mut Device> {
+        self.devices.iter_mut().filter(|d| d.is_gpu())
+    }
+
     /// Backfill a stable id from the positional device id for legacy/mixed-version
     /// inventories that predate stable_id (serde/proto default it to 0).
     pub fn backfill_stable_ids(&mut self) {
-        for g in &mut self.gpus {
+        for g in self.gpus_mut() {
             if g.stable_id == 0 {
-                g.stable_id = g.device_id as u64;
+                g.stable_id = u64::from(g.index);
             }
         }
     }
@@ -304,7 +367,7 @@ impl ResourceSet {
     /// The same inventory with GPU ids moved to their current encoding.
     pub fn with_renamed_gpus(&self, renamed: &HashMap<u64, u64>) -> ResourceSet {
         let mut out = self.clone();
-        for gpu in &mut out.gpus {
+        for gpu in out.gpus_mut() {
             if let Some(&id) = renamed.get(&gpu.stable_id) {
                 gpu.stable_id = id;
             }
@@ -316,15 +379,15 @@ impl ResourceSet {
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
     pub fn schedulable_fingerprint(&self) -> InventoryFingerprint {
-        let mut gpus = self.gpus.clone();
-        gpus.sort();
+        let mut devices = self.devices.clone();
+        devices.sort();
         let mut generic: Vec<(String, u64)> =
             self.generic.iter().map(|(k, v)| (k.clone(), *v)).collect();
         generic.sort();
         (
             self.cpus,
             self.memory_mb,
-            gpus,
+            devices,
             generic,
             self.fabric_binding_version,
             self.block_file_revision.clone(),
@@ -359,7 +422,7 @@ impl ResourceSet {
         ResourceSet {
             cpus,
             memory_mb,
-            gpus: self.gpus.clone(),
+            devices: self.devices.clone(),
             generic: self.generic.clone(),
             generation: self.generation,
             fabric_binding_version: self.fabric_binding_version,
@@ -371,8 +434,10 @@ impl ResourceSet {
     /// A request for everything this node has, as an exclusive job needs.
     pub fn as_request(&self) -> ResourceRequest {
         let mut request = ResourceRequest::with_scalar(self.cpus, self.memory_mb);
-        for gpu in &self.gpus {
-            request.add_devices("gpu", Some(&gpu.gpu_type), 1);
+        for device in &self.devices {
+            let device_type =
+                (!device.device_type.is_empty()).then_some(device.device_type.as_str());
+            request.add_devices(&device.gres_name, device_type, 1);
         }
         for (pool, &count) in &self.generic {
             let (name, device_type) = match pool.split_once(':') {
@@ -423,17 +488,19 @@ impl ResourceSet {
     }
 
     /// Whether this node hands out `gres_name` as specific devices, not a count.
+    /// GPUs always are: a node without any can offer none, not a countable pool.
     fn allocates_by_id(&self, gres_name: &str) -> bool {
-        gres_name == "gpu"
+        gres_name == GPU_GRES || self.devices_of(gres_name).next().is_some()
     }
 
     /// An allocated id the inventory lost means a held device may now be
-    /// reported under another id, so none of this node's GPUs can be trusted free.
-    fn holds_unknown_gpu(&self, allocated: &ResourceAllocations) -> bool {
+    /// reported under another id, so none of this node's devices of that kind
+    /// can be trusted free.
+    fn holds_unknown_device(&self, allocated: &ResourceAllocations, gres_name: &str) -> bool {
         allocated
-            .device_ids("gpu")
+            .device_ids(gres_name)
             .iter()
-            .any(|id| !self.gpus.iter().any(|g| g.stable_id == *id))
+            .any(|id| !self.devices_of(gres_name).any(|d| d.stable_id == *id))
     }
 
     /// Return unallocated device IDs for an injectable gres type.
@@ -443,32 +510,19 @@ impl ResourceSet {
         gres_name: &str,
         device_type: Option<&str>,
     ) -> Vec<u64> {
-        let allocated_ids: std::collections::HashSet<u64> = allocated
-            .devices
-            .get(gres_name)
-            .map(|devs| devs.iter().map(|d| d.device_id).collect())
-            .unwrap_or_default();
-
-        if gres_name == "gpu" {
-            if self.holds_unknown_gpu(allocated) {
-                return Vec::new();
-            }
-            self.gpus
-                .iter()
-                .filter(|g| {
-                    if allocated_ids.contains(&g.stable_id) {
-                        return false;
-                    }
-                    match device_type {
-                        None | Some("any") => true,
-                        Some(t) => g.gpu_type == t,
-                    }
-                })
-                .map(|g| g.stable_id)
-                .collect()
-        } else {
-            Vec::new()
+        if self.holds_unknown_device(allocated, gres_name) {
+            return Vec::new();
         }
+        let allocated_ids: std::collections::HashSet<u64> =
+            allocated.device_ids(gres_name).into_iter().collect();
+        self.devices_of(gres_name)
+            .filter(|d| !allocated_ids.contains(&d.stable_id))
+            .filter(|d| match device_type {
+                None | Some("any") => true,
+                Some(t) => d.device_type == t,
+            })
+            .map(|d| d.stable_id)
+            .collect()
     }
 
     /// Pick the first `count` available device IDs and build an allocation fragment.
@@ -489,14 +543,14 @@ impl ResourceSet {
     /// Count GPUs by type.
     pub fn gpu_counts(&self) -> HashMap<String, u32> {
         let mut counts = HashMap::new();
-        for gpu in &self.gpus {
-            *counts.entry(gpu.gpu_type.clone()).or_insert(0) += 1;
+        for gpu in self.gpus() {
+            *counts.entry(gpu.device_type.clone()).or_insert(0) += 1;
         }
         counts
     }
 
     pub fn total_gpus(&self) -> u32 {
-        self.gpus.len() as u32
+        self.gpus().count() as u32
     }
 }
 
@@ -532,15 +586,12 @@ pub fn parse_gres(gres: &str) -> Option<(String, Option<String>, u32)> {
 pub fn build_exclusive_allocation(inventory: &ResourceSet, memory_mb: u64) -> ResourceAllocations {
     let mut alloc = ResourceAllocations::with_scalar(inventory.cpus, memory_mb);
     alloc.generation = inventory.generation;
-    if !inventory.gpus.is_empty() {
-        alloc.devices.insert(
-            "gpu".into(),
-            inventory
-                .gpus
-                .iter()
-                .map(|g| AllocatedDevice::injectable(g.stable_id))
-                .collect(),
-        );
+    for device in &inventory.devices {
+        alloc
+            .devices
+            .entry(device.gres_name.clone())
+            .or_default()
+            .push(AllocatedDevice::injectable(device.stable_id));
     }
     for (name, count) in &inventory.generic {
         if *count > 0 {
@@ -616,9 +667,9 @@ mod tests {
     fn legacy_inventory_json_deserializes_without_topology() {
         let old = r#"{"cpus":8,"memory_mb":1024,"gpus":[{"device_id":0,"gpu_type":"amdgpu","memory_mb":4096,"peer_gpus":[],"link_type":"PCIe","stable_id":128}],"generic":{},"generation":7}"#;
         let inventory: super::ResourceSet = serde_json::from_str(old).unwrap();
-        assert!(inventory.gpus[0].topology.is_none());
+        assert!(inventory.devices[0].topology.is_none());
         assert_eq!(inventory.generation, 7);
-        assert_eq!(inventory.gpus[0].stable_id, 128);
+        assert_eq!(inventory.devices[0].stable_id, 128);
     }
 
     #[test]
@@ -626,15 +677,15 @@ mod tests {
         let inventory = sample_inventory();
         let renamed = HashMap::from([(0, 100)]);
         let out = inventory.with_renamed_gpus(&renamed);
-        assert_eq!(out.gpus[0].stable_id, 100);
-        assert_eq!(out.gpus[1].stable_id, 1);
+        assert_eq!(out.devices[0].stable_id, 100);
+        assert_eq!(out.devices[1].stable_id, 1);
     }
 
     #[test]
     fn inventory_fingerprint_tracks_membership_and_gpu_properties() {
         use spur_devices::topology::{DeviceTopology, FabricObservation, ObservationStatus};
         let mut a = sample_inventory();
-        a.gpus[0].topology = Some(DeviceTopology {
+        a.devices[0].topology = Some(DeviceTopology {
             fabric: Some(FabricObservation {
                 status: ObservationStatus::Consistent,
                 fabric_domain_id: Some("15".into()),
@@ -645,7 +696,7 @@ mod tests {
         let mut b = a.clone();
         b.generation += 1;
         assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
-        b.gpus[0]
+        b.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -655,10 +706,10 @@ mod tests {
             .fabric_domain_id = Some("16".into());
         assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
         b = a.clone();
-        b.gpus[0].memory_mb += 1;
+        b.devices[0].device_type = "mi250x".into();
         assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
         b = a.clone();
-        b.gpus.reverse();
+        b.devices.reverse();
         assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
     }
 
@@ -670,24 +721,20 @@ mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![1],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: vec![
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 0,
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![0],
-                    link_type: GpuLinkType::XGMI,
+                    index: 0,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 1,
+                    index: 1,
+                    topology: None,
                 },
             ],
             generic: HashMap::new(),
@@ -704,7 +751,7 @@ mod tests {
         assert_eq!(clamped.cpus, 64);
         assert_eq!(clamped.memory_mb, 256_000);
         // GPUs and generic pass through untouched.
-        assert_eq!(clamped.gpus.len(), 2);
+        assert_eq!(clamped.gpus().count(), 2);
     }
 
     #[test]
@@ -849,8 +896,8 @@ mod tests {
     fn test_available_device_ids() {
         let mut inventory = sample_inventory();
         // Positional device_id equals stable_id here so the classic meaning holds.
-        inventory.gpus[0].stable_id = 0;
-        inventory.gpus[1].stable_id = 1;
+        inventory.devices[0].stable_id = 0;
+        inventory.devices[1].stable_id = 1;
         let allocated = ResourceAllocations::from_device_ids("gpu", &[0]);
         let free = inventory.available_device_ids(&allocated, "gpu", Some("mi300x"));
         assert_eq!(free, vec![1]);
@@ -866,24 +913,20 @@ mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: vec![
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 128,
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
+                    index: 0,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 129,
+                    index: 1,
+                    topology: None,
                 },
             ],
             generic: HashMap::new(),
@@ -903,8 +946,8 @@ mod tests {
 
     fn two_gpu_inventory(a: u64, b: u64) -> ResourceSet {
         let mut inventory = sample_inventory();
-        inventory.gpus[0].stable_id = a;
-        inventory.gpus[1].stable_id = b;
+        inventory.devices[0].stable_id = a;
+        inventory.devices[1].stable_id = b;
         inventory
     }
 
@@ -956,42 +999,34 @@ mod tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: vec![
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 0,
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 192_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::XGMI,
+                    index: 0,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 1,
-                },
-                GpuResource {
-                    device_id: 2,
-                    gpu_type: "h100".into(),
-                    memory_mb: 80_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::NVLink,
+                    index: 1,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "h100".into(),
                     stable_id: 2,
-                },
-                GpuResource {
-                    device_id: 3,
-                    gpu_type: "h100".into(),
-                    memory_mb: 80_000,
-                    peer_gpus: vec![],
-                    link_type: GpuLinkType::NVLink,
+                    index: 2,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "h100".into(),
                     stable_id: 3,
+                    index: 3,
+                    topology: None,
                 },
             ],
             generic: HashMap::new(),
@@ -1029,16 +1064,8 @@ mod tests {
 mod accounting_tests {
     use super::*;
 
-    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
-        GpuResource {
-            device_id,
-            gpu_type: gpu_type.into(),
-            memory_mb: 65536,
-            peer_gpus: Vec::new(),
-            link_type: GpuLinkType::XGMI,
-            topology: None,
-            stable_id: device_id as u64,
-        }
+    fn gpu(device_id: u32, gpu_type: &str) -> Device {
+        Device::gpu(u64::from(device_id), gpu_type, device_id)
     }
 
     fn inventory() -> ResourceSet {
@@ -1047,7 +1074,7 @@ mod accounting_tests {
             block_file_revision: None,
             cpus: 64,
             memory_mb: 131_072,
-            gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
+            devices: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
             generic: HashMap::from([("bandwidth".to_string(), 100u64)]),
             generation: 0,
             topology: None,
@@ -1180,7 +1207,7 @@ mod accounting_tests {
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: Vec::new(),
+            devices: Vec::new(),
             generic: HashMap::from([("licenses".to_string(), 0u64)]),
             generation: 0,
             topology: None,
@@ -1202,24 +1229,20 @@ mod accounting_tests {
             block_file_revision: None,
             cpus: 16,
             memory_mb: 1024,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 196_608,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: vec![
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 128,
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 196_608,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::XGMI,
+                    index: 0,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 129,
+                    index: 1,
+                    topology: None,
                 },
             ],
             generic: HashMap::new(),
@@ -1276,33 +1299,27 @@ mod accounting_tests {
             block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
-            gpus: vec![
-                GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::XGMI,
-                    topology: None,
+            devices: vec![
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 0,
-                },
-                GpuResource {
-                    device_id: 1,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::XGMI,
+                    index: 0,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 0,
-                },
-                GpuResource {
-                    device_id: 5,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: Vec::new(),
-                    link_type: GpuLinkType::XGMI,
+                    index: 1,
                     topology: None,
+                },
+                Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 129,
+                    index: 5,
+                    topology: None,
                 },
             ],
             generic: HashMap::new(),
@@ -1310,7 +1327,7 @@ mod accounting_tests {
             topology: None,
         };
         inv.backfill_stable_ids();
-        let ids: Vec<u64> = inv.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: Vec<u64> = inv.gpus().map(|g| g.stable_id).collect();
         assert_eq!(ids, vec![0, 1, 129], "legacy zeros distinct, real id kept");
     }
 
@@ -1323,14 +1340,12 @@ mod accounting_tests {
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus: vec![GpuResource {
-                device_id: 0,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: Vec::new(),
-                link_type: GpuLinkType::XGMI,
-                topology: None,
+            devices: vec![Device {
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
                 stable_id: 128,
+                index: 0,
+                topology: None,
             }],
             generic: HashMap::new(),
             generation: 0,
@@ -1353,19 +1368,17 @@ mod request_tests {
     use super::*;
 
     fn mixed_inventory() -> ResourceSet {
-        let gpu = |device_id: u32, gpu_type: &str| GpuResource {
-            device_id,
-            gpu_type: gpu_type.into(),
-            memory_mb: 0,
-            peer_gpus: Vec::new(),
-            link_type: GpuLinkType::PCIe,
-            topology: None,
+        let gpu = |device_id: u32, gpu_type: &str| Device {
+            gres_name: "gpu".into(),
+            device_type: gpu_type.into(),
             stable_id: u64::from(device_id) + 1,
+            index: device_id,
+            topology: None,
         };
         ResourceSet {
             cpus: 16,
             memory_mb: 1024,
-            gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi250x")],
+            devices: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi250x")],
             generic: [("bandwidth:lustre".to_string(), 100)].into(),
             ..Default::default()
         }
@@ -1459,17 +1472,146 @@ mod request_tests {
 }
 
 #[cfg(test)]
-mod convergence_fields_tests {
+mod device_inventory_tests {
     use super::*;
+    use crate::device::Device;
+
+    /// The inventory types as the last GPU-only build defined them.
+    mod prev {
+        use super::super::{DeviceTopology, GpuLinkType};
+        use serde::{Deserialize, Serialize};
+        use std::collections::HashMap;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct GpuResource {
+            pub device_id: u32,
+            pub gpu_type: String,
+            pub memory_mb: u64,
+            pub peer_gpus: Vec<u32>,
+            pub link_type: GpuLinkType,
+            #[serde(default)]
+            pub stable_id: u64,
+            #[serde(default)]
+            pub topology: Option<DeviceTopology>,
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        pub struct ResourceSet {
+            pub cpus: u32,
+            pub memory_mb: u64,
+            pub gpus: Vec<GpuResource>,
+            pub generic: HashMap<String, u64>,
+            #[serde(default)]
+            pub generation: u64,
+            #[serde(default)]
+            pub fabric_binding_version: u32,
+            #[serde(default)]
+            pub block_file_revision: Option<String>,
+        }
+    }
+
+    fn nic(stable_id: u64, index: u32) -> Device {
+        Device::new("nic", "pollara400", stable_id, index)
+    }
+
+    fn gpu_and_nic_node() -> ResourceSet {
+        ResourceSet {
+            cpus: 16,
+            memory_mb: 1024,
+            devices: vec![
+                Device::gpu(0x110000, "mi300x", 0),
+                Device::gpu(0x120000, "mi300x", 1),
+                nic(0x050000, 0),
+                nic(0x850000, 1),
+            ],
+            ..Default::default()
+        }
+    }
 
     #[test]
-    fn gpu_resource_deserializes_without_stable_id() {
-        // Old Raft/JSON entries have no stable_id; must default to 0.
-        let json = r#"{"device_id":3,"gpu_type":"mi300x","memory_mb":196608,"peer_gpus":[],"link_type":"XGMI"}"#;
-        let g: GpuResource = serde_json::from_str(json).unwrap();
-        assert_eq!(g.stable_id, 0);
-        assert_eq!(g.device_id, 3);
+    fn a_legacy_gpu_inventory_reads_into_devices() {
+        let json = r#"{"cpus": 8, "memory_mb": 1024, "generic": {},
+            "gpus": [{"device_id": 0, "gpu_type": "mi300x", "memory_mb": 0, "peer_gpus": [],
+                      "link_type": "XGMI", "stable_id": 1114112}]}"#;
+        let set: ResourceSet = serde_json::from_str(json).expect("legacy inventory");
+        assert_eq!(set.devices, vec![Device::gpu(0x110000, "mi300x", 0)]);
     }
+
+    #[test]
+    fn devices_win_over_legacy_gpus_when_both_are_present() {
+        let json = r#"{"cpus": 8, "memory_mb": 1024, "generic": {},
+            "devices": [{"gres_name": "nic", "device_type": "pollara400", "stable_id": 7, "index": 0}],
+            "gpus": [{"device_id": 0, "gpu_type": "mi300x", "memory_mb": 0, "peer_gpus": [],
+                      "link_type": "XGMI", "stable_id": 1114112}]}"#;
+        let set: ResourceSet = serde_json::from_str(json).unwrap();
+        assert_eq!(set.devices, vec![nic(7, 0)]);
+    }
+
+    #[test]
+    fn a_new_inventory_still_reads_with_the_previous_build() {
+        let json = serde_json::to_string(&gpu_and_nic_node()).unwrap();
+        let old: prev::ResourceSet =
+            serde_json::from_str(&json).expect("a rolled-back controller must replay it");
+        let ids: Vec<u64> = old.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(
+            ids,
+            vec![0x110000, 0x120000],
+            "only GPUs, which it understands"
+        );
+        assert_eq!(old.gpus[1].device_id, 1);
+    }
+
+    #[test]
+    fn an_inventory_round_trips_with_every_device_kind() {
+        let set = gpu_and_nic_node();
+        let back: ResourceSet =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(back, set);
+    }
+
+    #[test]
+    fn an_untyped_nic_request_takes_typed_nics_by_id() {
+        let node = gpu_and_nic_node();
+        let mut req = ResourceRequest::with_scalar(1, 0);
+        req.add_devices("nic", None, 2);
+        assert!(node.can_satisfy(&req));
+
+        let alloc = build_node_allocation(&node, &ResourceAllocations::default(), &req);
+        assert_eq!(alloc.device_ids("nic"), vec![0x050000, 0x850000]);
+        assert!(!node.can_satisfy_with_allocated(&alloc, &req));
+    }
+
+    #[test]
+    fn a_typed_nic_request_takes_only_its_type() {
+        let node = gpu_and_nic_node();
+        let mut req = ResourceRequest::default();
+        req.add_devices("nic", Some("pollara400-vf"), 1);
+        assert!(!node.can_satisfy(&req));
+    }
+
+    #[test]
+    fn a_node_holding_a_nic_it_no_longer_has_offers_none() {
+        let node = gpu_and_nic_node();
+        let orphaned = ResourceAllocations::from_device_ids("nic", &[0x990000]);
+        assert!(node.available_device_ids(&orphaned, "nic", None).is_empty());
+        assert_eq!(
+            node.available_device_ids(&orphaned, "gpu", None).len(),
+            2,
+            "a lost NIC says nothing about the GPUs"
+        );
+    }
+
+    #[test]
+    fn an_exclusive_allocation_takes_every_device_of_every_kind() {
+        let alloc = build_exclusive_allocation(&gpu_and_nic_node(), 512);
+        assert_eq!(alloc.device_ids("gpu"), vec![0x110000, 0x120000]);
+        assert_eq!(alloc.device_ids("nic"), vec![0x050000, 0x850000]);
+    }
+}
+
+#[cfg(test)]
+mod convergence_fields_tests {
+    use super::*;
 
     #[test]
     fn resource_set_deserializes_without_generation() {

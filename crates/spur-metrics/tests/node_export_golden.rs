@@ -3,8 +3,9 @@
 
 //! Golden and catalog tests for node metrics export.
 
+use spur_core::device::Device;
 use spur_core::node::{Node, NodeState};
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations, ResourceSet};
+use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::{encode_nodes_metrics, node_state_metric_suffix};
 use std::path::PathBuf;
@@ -63,14 +64,12 @@ fn normalize_exposition(body: &str) -> String {
 fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {
     let mut gpus = Vec::new();
     for i in 0..gpu_count {
-        gpus.push(GpuResource {
-            device_id: i,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
+        gpus.push(Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id: i as u64,
+            index: i,
+            topology: None,
         });
     }
     ResourceSet {
@@ -78,7 +77,7 @@ fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {
         block_file_revision: None,
         cpus,
         memory_mb,
-        gpus,
+        devices: gpus,
         generic: Default::default(),
         generation: 0,
         topology: None,

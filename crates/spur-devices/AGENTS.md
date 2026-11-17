@@ -113,7 +113,7 @@ and countable pools (count-only, no device paths).
 
 `DeviceEntry` (entry.rs) carries all scheduling-relevant fields:
 gres_name, kind, device_id, stable_id, capability (Injectable vs
-CountablePool), memory_mb, links, link_type, pci_bdf, topology,
+CountablePool), pci_bdf, topology,
 vendor, inject_actions, device/shared edits. `node_paths()` yields the
 device's own node paths (not its kind's shared ones).
 
@@ -154,12 +154,6 @@ round-trips through annotation maps. Key fields: gpu-type, memory-mb,
 numa-node, cores (range notation: "0-3,8,16-18"), links (weight matrix),
 link-type, pci-bdf, compute-partition, memory-partition, unique-id,
 render-minor, stable-id, auto-detected.
-
-## Link type resolution
-
-`resolve_link_type()` (entry.rs): explicit annotation wins. Otherwise
-infers from link weights + vendor (AMD -> XGMI, NVIDIA -> NVLink,
-unknown -> PCIe). Default is PCIe when no link data present.
 
 ## Testing
 

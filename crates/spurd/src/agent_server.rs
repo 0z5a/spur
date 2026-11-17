@@ -636,7 +636,7 @@ fn replayable_allocations(
 /// index, not a current stable_id) is left untranslated; not a supported upgrade.
 pub fn translate_legacy_gpu_ids(
     recorded: &[u64],
-    current_gpus: &[spur_core::resource::GpuResource],
+    current_gpus: &[spur_core::device::Device],
 ) -> Option<Vec<u64>> {
     if recorded.is_empty() {
         return None;
@@ -693,7 +693,7 @@ pub fn may_record_positional_gpu_ids(resources: &crate::stepd::StepdJobResources
 /// The gpu ids adopted sessions hold, as replay puts them back on the ledger.
 pub fn startup_held_gpu_ids(
     descriptors: &[crate::stepd::StepdDescriptor],
-    current_gpus: &[spur_core::resource::GpuResource],
+    current_gpus: &[spur_core::device::Device],
 ) -> std::collections::HashSet<u64> {
     descriptors
         .iter()
@@ -6454,7 +6454,7 @@ fn refresh_bound_fabric(
     file_bound: bool,
     sysfs: &std::path::Path,
 ) -> Result<(), Status> {
-    for gpu in &mut inventory.gpus {
+    for gpu in inventory.gpus_mut() {
         if !bound.contains(&gpu.stable_id) {
             continue;
         }
@@ -11995,6 +11995,7 @@ impl AgentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::device::Device;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
 
@@ -19951,17 +19952,15 @@ mod tests {
     }
 
     fn unwrapped_test_reporter(device_ids: &[u32]) -> NodeReporter {
-        use spur_core::resource::{GpuLinkType, GpuResource};
+        use spur_core::device::Device;
         let gpus = device_ids
             .iter()
-            .map(|&device_id| GpuResource {
-                device_id,
-                gpu_type: "mi300x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-                topology: None,
+            .map(|&device_id| Device {
+                gres_name: "gpu".into(),
+                device_type: "mi300x".into(),
                 stable_id: device_id as u64,
+                index: device_id,
+                topology: None,
             })
             .collect();
         NodeReporter::new(
@@ -19970,7 +19969,7 @@ mod tests {
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8192,
-                gpus,
+                devices: gpus,
                 ..Default::default()
             },
             spur_net::NodeAddress {
@@ -20061,7 +20060,7 @@ mod tests {
         let mut inventory = reporter.snapshot_resources();
         inventory.generation = 7;
         inventory.fabric_binding_version = 1;
-        inventory.gpus[0].topology = Some(spur_core::resource::DeviceTopology {
+        inventory.devices[0].topology = Some(spur_core::resource::DeviceTopology {
             pci_bdf: Some("0001:04:00.0".into()),
             fabric: Some(spur_devices::topology::FabricObservation {
                 source: "test".into(),
@@ -20134,8 +20133,8 @@ mod tests {
         let (service, _, mut allocation) = fabric_dispatch_fixture();
         let mut inventory = service.reporter.snapshot_resources();
         inventory.fabric_binding_version = spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY;
-        inventory.gpus[0].gpu_type = "test".into();
-        let t = inventory.gpus[0].topology.as_mut().unwrap();
+        inventory.devices[0].device_type = "test".into();
+        let t = inventory.devices[0].topology.as_mut().unwrap();
         t.pci_root = Some("pci0001:00".into());
         t.numa_node = Some(0);
         t.vram_bytes = Some(192 * 1024_u64.pow(3));
@@ -20167,12 +20166,14 @@ mod tests {
             service.allocation.lock().await.release_job(501);
             let mut live = service.reporter.snapshot_resources();
             match property {
-                0 => live.gpus[0].gpu_type = "changed".into(),
-                1 => live.gpus[0].topology.as_mut().unwrap().vram_bytes = None,
-                2 => live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1),
-                3 => live.gpus[0].topology.as_mut().unwrap().pci_root = Some("pci0002:00".into()),
+                0 => live.devices[0].device_type = "changed".into(),
+                1 => live.devices[0].topology.as_mut().unwrap().vram_bytes = None,
+                2 => live.devices[0].topology.as_mut().unwrap().numa_node = Some(1),
+                3 => {
+                    live.devices[0].topology.as_mut().unwrap().pci_root = Some("pci0002:00".into())
+                }
                 4 => {
-                    live.gpus[0]
+                    live.devices[0]
                         .topology
                         .as_mut()
                         .unwrap()
@@ -20182,7 +20183,7 @@ mod tests {
                         .physical_domain_id = Some("other".into())
                 }
                 5 => {
-                    live.gpus[0]
+                    live.devices[0]
                         .topology
                         .as_mut()
                         .unwrap()
@@ -20191,7 +20192,7 @@ mod tests {
                         .unwrap()
                         .fabric_domain_id = Some("other".into())
                 }
-                6 => live.gpus.clear(),
+                6 => live.devices.clear(),
                 _ => live.generation += 1,
             }
             service.reporter.update_resources(live);
@@ -20232,7 +20233,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor);
         let mut live = service.reporter.snapshot_resources();
-        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
+        live.devices[0].topology.as_mut().unwrap().numa_node = Some(1);
         service.reporter.update_resources(live);
         let error = service
             .start_job(controller_start(501, 1))
@@ -20273,7 +20274,7 @@ mod tests {
             .await
             .unwrap();
         assert!(service.check_dispatch_allocation(&tracked).await.is_err());
-        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
+        live.devices[0].topology.as_mut().unwrap().numa_node = Some(1);
         service.reporter.update_resources(live);
         assert!(service
             .check_step_allocation(&tracked, "test-node")
@@ -20292,7 +20293,7 @@ mod tests {
             .unwrap();
         service.allocation.lock().await.release_job(501);
         let mut live = service.reporter.snapshot_resources();
-        live.gpus[0]
+        live.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -20387,7 +20388,7 @@ mod tests {
         let mut live = service.reporter.snapshot_resources();
         live.fabric_binding_version = 2;
         live.block_file_revision = Some(file.revision.clone());
-        live.gpus[0].topology = None;
+        live.devices[0].topology = None;
         service.reporter.update_resources(live);
         let endpoint = spur_core::block_file::declared_endpoint("test-node", 42);
         binding.version = 2;
@@ -20471,7 +20472,7 @@ mod tests {
         let (service, mut binding, _) = fabric_dispatch_fixture();
         *service.device_registry.lock().await = test_gpu_registry();
         let mut live = service.reporter.snapshot_resources();
-        live.gpus[0].stable_id = 1;
+        live.devices[0].stable_id = 1;
         service.reporter.update_resources(live.clone());
         binding.members[0].device.stable_id = 1;
         let mut tracked = TrackedJob::dummy(0);
@@ -20494,7 +20495,7 @@ mod tests {
                 .exit_code,
             0
         );
-        let fabric = live.gpus[0]
+        let fabric = live.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -20600,7 +20601,7 @@ mod tests {
         let (service, binding, _) = fabric_dispatch_fixture();
         let bound = binding.members.iter().map(|m| m.device.stable_id).collect();
         let mut inventory = service.reporter.snapshot_resources();
-        inventory.gpus[0]
+        inventory.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -20626,7 +20627,7 @@ mod tests {
         }
         refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
         assert_eq!(
-            inventory.gpus[0]
+            inventory.devices[0]
                 .topology
                 .as_ref()
                 .unwrap()
@@ -20640,7 +20641,7 @@ mod tests {
         std::fs::write(ualink.join("vpod_id"), "8").unwrap();
         refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
         assert_eq!(
-            inventory.gpus[0]
+            inventory.devices[0]
                 .topology
                 .as_ref()
                 .unwrap()
@@ -20651,7 +20652,7 @@ mod tests {
                 .as_deref(),
             Some("8")
         );
-        inventory.gpus[0].topology.as_mut().unwrap().pci_bdf = Some("../../escape".into());
+        inventory.devices[0].topology.as_mut().unwrap().pci_bdf = Some("../../escape".into());
         assert!(refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).is_err());
     }
 
@@ -20741,14 +20742,12 @@ mod tests {
                 block_file_revision: None,
                 cpus: 4,
                 memory_mb: 8192,
-                gpus: vec![spur_core::resource::GpuResource {
-                    device_id: 0,
-                    gpu_type: "mi300x".into(),
-                    memory_mb: 0,
-                    peer_gpus: vec![],
-                    link_type: spur_core::resource::GpuLinkType::XGMI,
-                    topology: None,
+                devices: vec![Device {
+                    gres_name: "gpu".into(),
+                    device_type: "mi300x".into(),
                     stable_id: 128,
+                    index: 0,
+                    topology: None,
                 }],
                 generic: Default::default(),
                 generation: 7,
@@ -25334,15 +25333,13 @@ mod tests {
         assert!(!alloc.allocated_cpus[3]);
     }
 
-    fn gpu_with_stable_id(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
-        spur_core::resource::GpuResource {
-            device_id,
-            gpu_type: "mi300x".into(),
-            memory_mb: 192_000,
-            peer_gpus: vec![],
-            link_type: spur_core::resource::GpuLinkType::XGMI,
-            topology: None,
+    fn gpu_with_stable_id(device_id: u32, stable_id: u64) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id,
+            index: device_id,
+            topology: None,
         }
     }
 
@@ -25820,20 +25817,18 @@ mod tests {
     // set would offer the partitions of the GPU it still runs on.
     #[test]
     fn a_bound_job_fences_its_gpu_repartitioned_across_a_restart() {
-        use spur_core::resource::{GpuLinkType, GpuResource};
+        use spur_core::device::Device;
         let state = tempfile::tempdir().expect("runtime state directory");
-        let gpu = |stable_id: u64| GpuResource {
-            device_id: 0,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
+        let gpu = |stable_id: u64| Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id,
+            index: 0,
+            topology: None,
         };
         let inventory = |ids: Vec<u64>| ResourceSet {
             cpus: 4,
-            gpus: ids.into_iter().map(gpu).collect(),
+            devices: ids.into_iter().map(gpu).collect(),
             ..Default::default()
         };
         let spx = inventory(vec![partition_sid(0x11, 0), partition_sid(0x12, 0)]);
@@ -25846,7 +25841,10 @@ mod tests {
             vec![partition_sid(0x11, 0)],
         ));
 
-        let held = startup_held_gpu_ids(std::slice::from_ref(&descriptor), &cpx.gpus);
+        let held = startup_held_gpu_ids(
+            std::slice::from_ref(&descriptor),
+            &cpx.gpus().cloned().collect::<Vec<_>>(),
+        );
         let startup = crate::reporter::startup_inventory(
             &cpx,
             Some(&spx),
@@ -25856,8 +25854,7 @@ mod tests {
 
         let on_gpu: Vec<u64> = startup
             .reported
-            .gpus
-            .iter()
+            .gpus()
             .map(|g| g.stable_id)
             .filter(|id| id >> 16 == 0x11)
             .collect();
@@ -25899,7 +25896,10 @@ mod tests {
             let adopted = store
                 .load_descriptor(&store.session_dir(962, 1, spur_core::step::STEP_BATCH))
                 .expect("reload descriptor");
-            let held = startup_held_gpu_ids(std::slice::from_ref(&adopted), &inventory.gpus);
+            let held = startup_held_gpu_ids(
+                std::slice::from_ref(&adopted),
+                &inventory.gpus().cloned().collect::<Vec<_>>(),
+            );
             let startup = crate::reporter::startup_inventory(
                 &inventory,
                 Some(&inventory),
@@ -25956,9 +25956,9 @@ mod tests {
         let new = partition_sid(0x11, 1);
         let inventory = ResourceSet {
             cpus: 4,
-            gpus: test_reporter_with_gpus(&[old as u32, partition_sid(0x12, 0) as u32])
+            devices: test_reporter_with_gpus(&[old as u32, partition_sid(0x12, 0) as u32])
                 .snapshot_resources()
-                .gpus,
+                .devices,
             ..Default::default()
         };
         let mut allocation = NodeAllocation::new("test-node".into(), &inventory);

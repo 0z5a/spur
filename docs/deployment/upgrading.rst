@@ -1151,6 +1151,29 @@ change, so add the field after every controller is upgraded. Restarts and agent
 registrations never write it. A rollback after the entry has been written is not
 supported because older controllers cannot replay it: roll forward.
 
+Generic device inventory
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Node inventory now lists every allocatable device, of every kind, in
+``ResourceSet.devices`` (``gres_name``, ``device_type``, ``stable_id``,
+``index``, ``topology``). GPUs are entries with ``gres_name = "gpu"``.
+
+* **Deprecated: ``ResourceSet.gpus`` and ``GpuResource``.** The gRPC API still
+  fills the GPU-only ``gpus`` list for this release, so existing clients keep
+  working, but it will be removed in a future release. Read ``devices``.
+  ``GpuResource.peer_gpus`` is now always empty and ``link_type`` always PCIe;
+  ``memory_mb`` is derived from the device's VRAM (``topology.vram_bytes``).
+* **Raft log and snapshots.** A controller reads node inventories written by
+  earlier releases, and keeps writing the old ``gpus`` list next to
+  ``devices``, so you can roll back to the previous release.
+* **Agent state files.** An upgraded ``spurd`` reads the
+  ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
+  wrote. After a rollback, an older ``spurd`` ignores fences the newer one
+  wrote, as it would an unreadable file.
+* **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
+  the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
+  both only fed ``peer_gpus`` and ``link_type``.
+
 See Also
 --------
 

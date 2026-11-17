@@ -8,8 +8,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
-use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
+use spur_core::device::Device;
+use spur_core::resource::ResourceSet;
+use spur_devices::DeviceRegistry;
 use spur_proto::proto::{
     RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus, StepdRecoveryRequest,
     StepdRecoveryResponse,
@@ -489,7 +490,7 @@ impl NodeReporter {
         let mut cur = write_recover(&self.resources);
         let changed = cur.cpus != fresh.cpus
             || cur.memory_mb != fresh.memory_mb
-            || cur.gpus != fresh.gpus
+            || cur.devices != fresh.devices
             || cur.generic != fresh.generic
             || cur.fabric_binding_version != fresh.fabric_binding_version
             || cur.block_file_revision != fresh.block_file_revision
@@ -891,7 +892,7 @@ pub fn classify(
 ) -> InventoryDelta {
     if old.cpus == new.cpus
         && old.memory_mb == new.memory_mb
-        && old.gpus == new.gpus
+        && old.devices == new.devices
         && old.generic == new.generic
         && old.fabric_binding_version == new.fabric_binding_version
         && old.block_file_revision == new.block_file_revision
@@ -899,9 +900,9 @@ pub fn classify(
     {
         return InventoryDelta::Unchanged;
     }
-    let new_ids: std::collections::HashSet<u64> = new.gpus.iter().map(|g| g.stable_id).collect();
-    let old_ids: Vec<u64> = old.gpus.iter().map(|g| g.stable_id).collect();
-    let new_list: Vec<u64> = new.gpus.iter().map(|g| g.stable_id).collect();
+    let new_ids: std::collections::HashSet<u64> = new.gpus().map(|g| g.stable_id).collect();
+    let old_ids: Vec<u64> = old.gpus().map(|g| g.stable_id).collect();
+    let new_list: Vec<u64> = new.gpus().map(|g| g.stable_id).collect();
     // A held id that survives a repartition names different silicon now.
     let layout = spur_core::gpu_identity::diff_layout(&old_ids, &new_list);
     let lost_held = allocated_stable_ids
@@ -929,7 +930,7 @@ pub struct RefreshPlan {
 }
 
 pub fn plan_refresh(old: &ResourceSet, fresh: &ResourceSet, held: &HashSet<u64>) -> RefreshPlan {
-    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+    let ids = |set: &ResourceSet| set.gpus().map(|g| g.stable_id).collect::<Vec<_>>();
     let renamed = spur_core::gpu_identity::diff_layout(&ids(old), &ids(fresh)).safe_renames();
     // After a failed register the ledger already holds the new id.
     let held_renamed: HashMap<u64, u64> = renamed
@@ -980,7 +981,7 @@ pub const FENCES_FILE: &str = "inventory-fences.json";
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Fences {
     #[serde(default)]
-    pub anchors: std::collections::BTreeMap<u64, Vec<GpuResource>>,
+    pub anchors: std::collections::BTreeMap<u64, Vec<Device>>,
 }
 
 impl Fences {
@@ -1004,7 +1005,7 @@ impl Fences {
             .anchors
             .iter()
             .map(|(&anchor, pinned)| {
-                let kept: Vec<GpuResource> = pinned
+                let kept: Vec<Device> = pinned
                     .iter()
                     .filter(|g| held.contains(&g.stable_id))
                     .cloned()
@@ -1016,7 +1017,7 @@ impl Fences {
         Fences { anchors }
     }
 
-    fn pin(&mut self, anchor: u64, gpu: &GpuResource) {
+    fn pin(&mut self, anchor: u64, gpu: &Device) {
         let pinned = self.anchors.entry(anchor).or_default();
         if !pinned.iter().any(|g| g.stable_id == gpu.stable_id) {
             pinned.push(gpu.clone());
@@ -1029,14 +1030,15 @@ impl Fences {
     pub fn apply(&self, fresh: &ResourceSet) -> ResourceSet {
         let pinned_ids = self.pinned_ids();
         let mut effective = fresh.clone();
-        effective.gpus.retain(|g| {
-            !self.anchors.contains_key(&bdf_anchor(g.stable_id))
-                && !pinned_ids.contains(&g.stable_id)
+        effective.devices.retain(|g| {
+            !g.is_gpu()
+                || (!self.anchors.contains_key(&bdf_anchor(g.stable_id))
+                    && !pinned_ids.contains(&g.stable_id))
         });
-        let mut pinned: Vec<&GpuResource> = self.anchors.values().flatten().collect();
+        let mut pinned: Vec<&Device> = self.anchors.values().flatten().collect();
         pinned.sort_by_key(|g| g.stable_id);
         effective
-            .gpus
+            .devices
             .extend(pinned.into_iter().map(|g| pinned_gpu(g, fresh)));
         effective
     }
@@ -1164,7 +1166,7 @@ pub fn plan_tick(
     }
     let effective = next.apply(fresh);
     let delta = refresh_delta(old, &effective, &plan);
-    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+    let ids = |set: &ResourceSet| set.gpus().map(|g| g.stable_id).collect::<Vec<_>>();
     let layout = spur_core::gpu_identity::diff_layout(&ids(&plan.baseline), &ids(fresh));
     let fresh_ids: HashSet<u64> = ids(fresh).into_iter().collect();
     let lost_held = plan
@@ -1178,7 +1180,7 @@ pub fn plan_tick(
         fences: next,
         effective,
         delta,
-        fresh_anchors: fresh.gpus.iter().map(|g| bdf_anchor(g.stable_id)).collect(),
+        fresh_anchors: fresh.gpus().map(|g| bdf_anchor(g.stable_id)).collect(),
         lost_held,
     }
 }
@@ -1208,13 +1210,12 @@ fn repartitioned_held<'a>(
     old: &ResourceSet,
     fresh: &ResourceSet,
     plan: &'a RefreshPlan,
-) -> Vec<(u64, &'a GpuResource)> {
-    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+) -> Vec<(u64, &'a Device)> {
+    let ids = |set: &ResourceSet| set.gpus().map(|g| g.stable_id).collect::<Vec<_>>();
     let layout = spur_core::gpu_identity::diff_layout(&ids(old), &ids(fresh));
-    let anchors: HashSet<u64> = fresh.gpus.iter().map(|g| bdf_anchor(g.stable_id)).collect();
+    let anchors: HashSet<u64> = fresh.gpus().map(|g| bdf_anchor(g.stable_id)).collect();
     plan.baseline
-        .gpus
-        .iter()
+        .gpus()
         .filter(|g| plan.held.contains(&g.stable_id))
         .map(|g| {
             let anchor = spur_core::gpu_identity::current_anchor(g.stable_id, &anchors);
@@ -1264,7 +1265,7 @@ fn startup_inventory_without_baseline(
 ) -> StartupInventory {
     let fences = fences.pruned(held);
     let fresh = &fences.apply(fresh);
-    let fresh_ids: HashSet<u64> = fresh.gpus.iter().map(|g| g.stable_id).collect();
+    let fresh_ids: HashSet<u64> = fresh.gpus().map(|g| g.stable_id).collect();
     let renamed: HashMap<u64, u64> = held
         .iter()
         .filter(|id| !fresh_ids.contains(id))
@@ -1276,16 +1277,15 @@ fn startup_inventory_without_baseline(
         })
         .collect();
     let current = |id: &u64| renamed.get(id).copied().unwrap_or(*id);
-    let pinned: Vec<GpuResource> = held
+    let pinned: Vec<Device> = held
         .iter()
         .map(current)
         .filter(|id| !fresh_ids.contains(id))
         .filter_map(|id| {
             let gpu = fresh
-                .gpus
-                .iter()
+                .gpus()
                 .find(|g| bdf_anchor(g.stable_id) == bdf_anchor(id))?;
-            Some(GpuResource {
+            Some(Device {
                 stable_id: id,
                 ..gpu.clone()
             })
@@ -1300,7 +1300,7 @@ fn startup_inventory_without_baseline(
     }
     let pinned_anchors: HashSet<u64> = pinned.iter().map(|g| bdf_anchor(g.stable_id)).collect();
     let mut synthetic = fresh.clone();
-    synthetic.gpus.extend(pinned);
+    synthetic.devices.extend(pinned);
     // Only GPUs with a pinned id are fenced; other held GPUs keep their siblings.
     let fenced: HashSet<u64> = held
         .iter()
@@ -1316,7 +1316,7 @@ fn startup_inventory_without_baseline(
 
 /// Plain GPUs without fabric evidence stay untouched, so a failed scan does not churn their inventory.
 pub fn mark_fabric_unavailable(resources: &mut ResourceSet, declared: bool) {
-    for gpu in &mut resources.gpus {
+    for gpu in resources.gpus_mut() {
         let observed = gpu.topology.as_ref().is_some_and(|t| t.fabric.is_some());
         if declared || observed {
             mark_gpu_fabric_unavailable(gpu);
@@ -1326,14 +1326,13 @@ pub fn mark_fabric_unavailable(resources: &mut ResourceSet, declared: bool) {
 
 pub fn retain_native_fabric_loss(old: &ResourceSet, fresh: &mut ResourceSet) {
     let observed: std::collections::HashMap<_, _> = old
-        .gpus
-        .iter()
+        .gpus()
         .filter_map(|gpu| {
             let fabric = gpu.topology.as_ref()?.fabric.as_ref()?;
             (fabric.source != "device-discovery").then_some((gpu.stable_id, fabric))
         })
         .collect();
-    for gpu in &mut fresh.gpus {
+    for gpu in fresh.gpus_mut() {
         let Some(previous) = observed.get(&gpu.stable_id) else {
             continue;
         };
@@ -1349,7 +1348,7 @@ pub fn retain_native_fabric_loss(old: &ResourceSet, fresh: &mut ResourceSet) {
     }
 }
 
-fn mark_gpu_fabric_unavailable(gpu: &mut GpuResource) {
+fn mark_gpu_fabric_unavailable(gpu: &mut Device) {
     let topology = gpu.topology.get_or_insert_with(Default::default);
     let source = topology
         .fabric
@@ -1379,15 +1378,14 @@ pub fn reconcile_free_pool(
     held_ids: &std::collections::HashSet<u64>,
 ) -> ResourceSet {
     let held_bdfs =
-        spur_core::gpu_identity::held_anchors(held_ids, fresh.gpus.iter().map(|g| g.stable_id));
+        spur_core::gpu_identity::held_anchors(held_ids, fresh.gpus().map(|g| g.stable_id));
 
     let mut reconciled = fresh.clone();
     reconciled
-        .gpus
-        .retain(|g| !held_bdfs.contains(&bdf_anchor(g.stable_id)));
+        .devices
+        .retain(|g| !g.is_gpu() || !held_bdfs.contains(&bdf_anchor(g.stable_id)));
 
-    let present: std::collections::HashSet<u64> =
-        reconciled.gpus.iter().map(|g| g.stable_id).collect();
+    let present: std::collections::HashSet<u64> = reconciled.gpus().map(|g| g.stable_id).collect();
     let mut missing: Vec<u64> = held_ids
         .iter()
         .copied()
@@ -1396,17 +1394,17 @@ pub fn reconcile_free_pool(
     missing.sort_unstable();
 
     for id in missing {
-        if let Some(gpu) = baseline.gpus.iter().find(|g| g.stable_id == id) {
-            reconciled.gpus.push(pinned_gpu(gpu, fresh));
+        if let Some(gpu) = baseline.gpus().find(|g| g.stable_id == id) {
+            reconciled.devices.push(pinned_gpu(gpu, fresh));
         }
     }
     reconciled
 }
 
 /// Accounting keeps the held identity; observations describe the current device.
-fn pinned_gpu(held: &GpuResource, fresh: &ResourceSet) -> GpuResource {
+fn pinned_gpu(held: &Device, fresh: &ResourceSet) -> Device {
     let mut pinned = held.clone();
-    match fresh.gpus.iter().find(|g| g.stable_id == held.stable_id) {
+    match fresh.gpus().find(|g| g.stable_id == held.stable_id) {
         Some(current) => pinned.topology = current.topology.clone(),
         None => mark_gpu_fabric_unavailable(&mut pinned),
     }
@@ -1417,12 +1415,11 @@ fn pinned_gpu(held: &GpuResource, fresh: &ResourceSet) -> GpuResource {
 pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
     let cpus = discover_cpus();
     let memory_mb = discover_memory_mb();
-    let gpus = gpus_from_registry(registry);
 
     ResourceSet {
         cpus,
         memory_mb,
-        gpus,
+        devices: devices_from_registry(registry),
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
@@ -1449,43 +1446,18 @@ pub fn refresh_block_file(resources: &mut ResourceSet, path: Option<&std::path::
         });
 }
 
-fn build_peer_gpus(links: Option<&[i32]>, gpu_device_ids: &[u32]) -> Vec<u32> {
-    let Some(links) = links else {
-        return Vec::new();
-    };
-    links
-        .iter()
-        .enumerate()
-        .filter_map(|(j, &w)| {
-            if w > 0 && j < gpu_device_ids.len() {
-                Some(gpu_device_ids[j])
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Convert injectable GPU registry entries to `GpuResource` for the scheduler.
-fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
-    let gpu_entries: Vec<_> = registry
+/// Injectable GPU registry entries as the scheduler's devices.
+fn devices_from_registry(registry: &DeviceRegistry) -> Vec<Device> {
+    registry
         .list()
         .iter()
         .filter(|e| e.is_injectable() && e.gres_name == "gpu")
-        .collect();
-
-    let gpu_device_ids: Vec<u32> = gpu_entries.iter().map(|e| e.device_id).collect();
-
-    gpu_entries
-        .iter()
-        .map(|entry| GpuResource {
-            device_id: entry.device_id,
-            gpu_type: entry.resource_type.clone().unwrap_or_default(),
-            memory_mb: entry.memory_mb,
-            peer_gpus: build_peer_gpus(entry.links.as_deref(), &gpu_device_ids),
-            link_type: link_type_to_gpu(resolve_link_type(entry)),
-            topology: entry.topology.clone(),
+        .map(|entry| Device {
+            gres_name: entry.gres_name.clone(),
+            device_type: entry.resource_type.clone().unwrap_or_default(),
             stable_id: entry.stable_id,
+            index: entry.device_id,
+            topology: entry.topology.clone(),
         })
         .collect()
 }
@@ -1503,14 +1475,6 @@ fn generic_from_registry(registry: &DeviceRegistry) -> HashMap<String, u64> {
         *generic.entry(key).or_insert(0) += entry.capacity;
     }
     generic
-}
-
-fn link_type_to_gpu(lt: LinkType) -> GpuLinkType {
-    match lt {
-        LinkType::Xgmi => GpuLinkType::XGMI,
-        LinkType::Nvlink => GpuLinkType::NVLink,
-        LinkType::Pcie => GpuLinkType::PCIe,
-    }
 }
 
 /// Count online CPUs from sysfs.
@@ -1751,29 +1715,13 @@ pub fn allocations_to_proto(
 }
 
 pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
+    let (devices, legacy_gpus) = spur_core::device::devices_to_proto(&r.devices);
+    #[allow(deprecated)]
     ProtoResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
-        gpus: r
-            .gpus
-            .iter()
-            .map(|g| spur_proto::proto::GpuResource {
-                device_id: g.device_id,
-                gpu_type: g.gpu_type.clone(),
-                memory_mb: g.memory_mb,
-                peer_gpus: g.peer_gpus.clone(),
-                link_type: match g.link_type {
-                    GpuLinkType::XGMI => spur_proto::proto::GpuLinkType::GpuLinkXgmi as i32,
-                    GpuLinkType::NVLink => spur_proto::proto::GpuLinkType::GpuLinkNvlink as i32,
-                    GpuLinkType::PCIe => spur_proto::proto::GpuLinkType::GpuLinkPcie as i32,
-                },
-                topology: g
-                    .topology
-                    .as_ref()
-                    .map(spur_core::device_topology::to_proto),
-                stable_id: g.stable_id,
-            })
-            .collect(),
+        gpus: legacy_gpus,
+        devices,
         generic: r.generic.clone(),
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
@@ -1810,16 +1758,16 @@ mod tests {
     #[test]
     fn membership_only_refresh_is_debounced_by_the_observed_membership() {
         let mut baseline = ResourceSet {
-            gpus: vec![gpu(0, 128)],
+            devices: vec![gpu(0, 128)],
             ..Default::default()
         };
-        baseline.gpus[0].topology = Some(observed_topology("15"));
+        baseline.devices[0].topology = Some(observed_topology("15"));
         let mut first = baseline.clone();
-        first.gpus[0].topology = Some(observed_topology("16"));
+        first.devices[0].topology = Some(observed_topology("16"));
         let delta = classify(&baseline, &first, &Default::default());
         assert_eq!(delta, InventoryDelta::FreeCapacityChanged);
         let mut next = first.clone();
-        next.gpus[0].topology = Some(observed_topology("17"));
+        next.devices[0].topology = Some(observed_topology("17"));
         assert_eq!(
             next_refresh_action(
                 &delta,
@@ -1846,23 +1794,23 @@ mod tests {
     fn pinned_accounting_does_not_pin_stale_observations() {
         use spur_devices::topology::ObservationStatus;
         let mut baseline = ResourceSet {
-            gpus: vec![gpu(0, 128)],
+            devices: vec![gpu(0, 128)],
             ..Default::default()
         };
-        baseline.gpus[0].topology = Some(observed_topology("15"));
+        baseline.devices[0].topology = Some(observed_topology("15"));
         let mut fresh = baseline.clone();
-        fresh.gpus[0].topology = Some(observed_topology("16"));
+        fresh.devices[0].topology = Some(observed_topology("16"));
         let held = [128].into_iter().collect();
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
-        assert_eq!(reconciled.gpus[0].topology, fresh.gpus[0].topology);
-        fresh.gpus[0].topology = None;
-        assert!(reconcile_free_pool(&fresh, &baseline, &held).gpus[0]
+        assert_eq!(reconciled.devices[0].topology, fresh.devices[0].topology);
+        fresh.devices[0].topology = None;
+        assert!(reconcile_free_pool(&fresh, &baseline, &held).devices[0]
             .topology
             .is_none());
-        fresh.gpus.clear();
+        fresh.devices.clear();
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
-        assert_eq!(reconciled.gpus[0].stable_id, 128);
-        let fabric = reconciled.gpus[0]
+        assert_eq!(reconciled.devices[0].stable_id, 128);
+        let fabric = reconciled.devices[0]
             .topology
             .as_ref()
             .unwrap()
@@ -1877,19 +1825,19 @@ mod tests {
     fn full_discovery_failure_keeps_capacity_but_invalidates_fabric() {
         use spur_devices::topology::ObservationStatus;
         let mut baseline = ResourceSet {
-            gpus: vec![gpu(0, 128)],
+            devices: vec![gpu(0, 128)],
             cpus: 8,
             memory_mb: 1024,
             ..Default::default()
         };
-        baseline.gpus[0].topology = Some(observed_topology("15"));
+        baseline.devices[0].topology = Some(observed_topology("15"));
         let mut unavailable = baseline.clone();
         mark_fabric_unavailable(&mut unavailable, false);
-        assert_eq!(unavailable.gpus[0].stable_id, 128);
+        assert_eq!(unavailable.devices[0].stable_id, 128);
         assert_eq!(unavailable.cpus, 8);
         assert_eq!(unavailable.memory_mb, 1024);
         assert_eq!(
-            unavailable.gpus[0]
+            unavailable.devices[0]
                 .topology
                 .as_ref()
                 .unwrap()
@@ -1911,7 +1859,7 @@ mod tests {
     #[test]
     fn discovery_failure_leaves_plain_gpu_inventory_unchanged() {
         let baseline = ResourceSet {
-            gpus: vec![gpu(0, 128)],
+            devices: vec![gpu(0, 128)],
             cpus: 8,
             memory_mb: 1024,
             generation: 7,
@@ -1920,7 +1868,7 @@ mod tests {
         let mut retained = baseline.clone();
         retained.generation += 1;
         mark_fabric_unavailable(&mut retained, false);
-        assert!(retained.gpus[0].topology.is_none());
+        assert!(retained.devices[0].topology.is_none());
         assert_eq!(
             classify(&baseline, &retained, &Default::default()),
             InventoryDelta::Unchanged
@@ -1930,7 +1878,7 @@ mod tests {
             baseline.schedulable_fingerprint()
         );
         mark_fabric_unavailable(&mut retained, true);
-        assert!(retained.gpus[0].topology.is_some());
+        assert!(retained.devices[0].topology.is_some());
     }
 
     fn declaration_only_node(
@@ -1943,11 +1891,11 @@ mod tests {
             generation: 7,
             fabric_binding_version: 2,
             block_file_revision: Some(file.revision.clone()),
-            gpus: vec![gpu(0, 256), gpu(1, 512)],
+            devices: vec![gpu(0, 256), gpu(1, 512)],
             ..Default::default()
         };
         if with_topology {
-            for gpu in &mut inventory.gpus {
+            for gpu in inventory.gpus_mut() {
                 gpu.topology = Some(spur_core::resource::DeviceTopology {
                     numa_node: Some(1),
                     ..Default::default()
@@ -1979,8 +1927,8 @@ mod tests {
         let path = dir.path().join("topology.conf");
         let file = spur_core::block_file::BlockFile::parse("BlockName=a Nodes=n0").unwrap();
         let (_, mut node) = declaration_only_node(false);
-        node.total_resources.gpus.truncate(1);
-        node.total_resources.gpus[0].topology = Some(observed_topology("15"));
+        node.total_resources.devices.truncate(1);
+        node.total_resources.devices[0].topology = Some(observed_topology("15"));
         refresh_block_file(&mut node.total_resources, Some(&path));
         let baseline = node.total_resources.clone();
         assert!(baseline.block_file_revision.is_none());
@@ -2005,7 +1953,7 @@ mod tests {
                 node.total_resources.schedulable_fingerprint()
             );
         }
-        node.total_resources.gpus[0].topology = None;
+        node.total_resources.devices[0].topology = None;
         std::fs::write(&path, file.to_text()).unwrap();
         refresh_block_file(&mut node.total_resources, Some(&path));
         assert_eq!(
@@ -2020,9 +1968,9 @@ mod tests {
     #[test]
     fn vanished_native_source_stays_unavailable_until_discovery_recovers() {
         let (file, mut node) = declaration_only_node(true);
-        node.total_resources.gpus[0].topology = Some(observed_topology("15"));
+        node.total_resources.devices[0].topology = Some(observed_topology("15"));
         let baseline = node.total_resources.clone();
-        node.total_resources.gpus[0]
+        node.total_resources.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -2030,7 +1978,7 @@ mod tests {
         retain_native_fabric_loss(&baseline, &mut node.total_resources);
         assert!(spur_core::fabric::has_native_fabric(&node.total_resources));
         let lost = node.total_resources.clone();
-        let fabric = lost.gpus[0]
+        let fabric = lost.devices[0]
             .topology
             .as_ref()
             .unwrap()
@@ -2041,11 +1989,11 @@ mod tests {
             fabric.status,
             spur_core::fabric::ObservationStatus::Unavailable
         );
-        assert_eq!(lost.gpus[0].stable_id, baseline.gpus[0].stable_id);
+        assert_eq!(lost.devices[0].stable_id, baseline.devices[0].stable_id);
         let view = declaration_only_view(&file, &node);
         assert!(view.blocks.is_empty());
         assert!(view.notices[0].warning);
-        node.total_resources.gpus[0]
+        node.total_resources.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -2056,7 +2004,7 @@ mod tests {
         retain_native_fabric_loss(&lost, &mut recovered);
         assert_eq!(recovered, baseline);
         let mut declaration = baseline.clone();
-        for gpu in &mut declaration.gpus {
+        for gpu in declaration.gpus_mut() {
             gpu.topology = None;
         }
         let mut unchanged = declaration.clone();
@@ -2080,15 +2028,11 @@ mod tests {
                 InventoryDelta::FreeCapacityChanged
             );
             assert_eq!(
-                unavailable
-                    .gpus
-                    .iter()
-                    .map(|g| g.stable_id)
-                    .collect::<Vec<_>>(),
+                unavailable.gpus().map(|g| g.stable_id).collect::<Vec<_>>(),
                 [256, 512]
             );
             assert_eq!((unavailable.cpus, unavailable.memory_mb), (8, 1024));
-            for gpu in &unavailable.gpus {
+            for gpu in unavailable.gpus() {
                 let topology = gpu.topology.as_ref().unwrap();
                 assert_eq!(
                     topology.fabric.as_ref().unwrap().status,
@@ -2138,7 +2082,7 @@ mod tests {
                 .unwrap();
             let held = [256].into_iter().collect();
             let mut fresh = baseline.clone();
-            fresh.gpus.retain(|g| g.stable_id != 256);
+            fresh.devices.retain(|g| g.stable_id != 256);
             assert_eq!(
                 classify(&baseline, &fresh, &held),
                 InventoryDelta::AllocatedDevicesLost
@@ -2148,12 +2092,12 @@ mod tests {
                 reconciled.schedulable_fingerprint(),
                 baseline.schedulable_fingerprint()
             );
-            assert_eq!(reconciled.gpus.len(), 2);
+            assert_eq!(reconciled.gpus().count(), 2);
             assert_eq!(
-                reconciled.gpus.iter().find(|g| g.stable_id == 512),
-                baseline.gpus.iter().find(|g| g.stable_id == 512)
+                reconciled.gpus().find(|g| g.stable_id == 512),
+                baseline.gpus().find(|g| g.stable_id == 512)
             );
-            let missing = reconciled.gpus.iter().find(|g| g.stable_id == 256).unwrap();
+            let missing = reconciled.gpus().find(|g| g.stable_id == 256).unwrap();
             assert_eq!(
                 missing
                     .topology
@@ -2207,13 +2151,13 @@ mod tests {
         let mut registry = DeviceRegistry::new();
         registry.populate(&cache, &GresCache::from_entries(&[]));
         let inventory = ResourceSet {
-            gpus: gpus_from_registry(&registry),
+            devices: devices_from_registry(&registry),
             ..Default::default()
         };
-        assert_eq!(inventory.gpus[0].topology.as_ref(), Some(&expected));
+        assert_eq!(inventory.devices[0].topology.as_ref(), Some(&expected));
         let proto = resource_to_proto(&inventory);
         let restored =
-            spur_core::device_topology::from_proto(proto.gpus[0].topology.clone().unwrap());
+            spur_core::device_topology::from_proto(proto.devices[0].topology.clone().unwrap());
         assert_eq!(restored, expected);
     }
 
@@ -2341,7 +2285,7 @@ mod tests {
             (sid(0x11, 0), "/dev/dri/renderD200"),
             (sid(0x11, 1), "/dev/dri/renderD201"),
         ]);
-        let reported: HashSet<u64> = tick.reported().gpus.iter().map(|g| g.stable_id).collect();
+        let reported: HashSet<u64> = tick.reported().gpus().map(|g| g.stable_id).collect();
         let published = candidate.with_pinned(&previous, "gpu", &reported, &tick.pinned_ids());
 
         let path = |id: u64| {
@@ -2352,47 +2296,6 @@ mod tests {
         };
         assert_eq!(path(sid(0x11, 1)), vec!["/dev/dri/renderD201".to_string()]);
         assert_eq!(path(sid(0x12, 0)), vec!["/dev/dri/renderD130".to_string()]);
-    }
-
-    #[test]
-    fn test_gpus_from_registry_link_type() {
-        let spec = CdiSpec {
-            cdi_version: "0.6.0".into(),
-            kind: "amd.com/gpu".into(),
-            annotations: Default::default(),
-            devices: vec![CdiDevice {
-                name: "0".into(),
-                annotations: [
-                    (annotations::GPU_TYPE.into(), "mi300x".into()),
-                    (annotations::LINK_TYPE.into(), "xgmi".into()),
-                ]
-                .into(),
-                container_edits: Some(ContainerEdits {
-                    device_nodes: vec![DeviceNode {
-                        path: "/dev/dri/renderD128".into(),
-                        host_path: None,
-                        r#type: None,
-                        major: None,
-                        minor: None,
-                        file_mode: None,
-                        permissions: None,
-                        uid: None,
-                        gid: None,
-                    }],
-                    ..Default::default()
-                }),
-            }],
-            container_edits: None,
-        };
-
-        let mut cache = CdiCache::new();
-        cache.add_specs(&[spec]);
-        let mut reg = DeviceRegistry::new();
-        reg.populate(&cache, &GresCache::from_entries(&[]));
-
-        let gpus = gpus_from_registry(&reg);
-        assert_eq!(gpus.len(), 1);
-        assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
     }
 
     #[test]
@@ -2431,59 +2334,9 @@ mod tests {
         let mut reg = DeviceRegistry::new();
         reg.populate(&cache, &GresCache::from_entries(&[]));
 
-        let gpus = gpus_from_registry(&reg);
+        let gpus = devices_from_registry(&reg);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].stable_id, 129);
-    }
-
-    #[test]
-    fn test_build_peer_gpus_from_links() {
-        let gpu_device_ids = [0, 1, 2, 3];
-        let links = [-1, 4, 4, 0];
-        assert_eq!(build_peer_gpus(Some(&links), &gpu_device_ids), vec![1, 2]);
-    }
-
-    #[test]
-    fn test_build_peer_gpus_none_links() {
-        let gpu_device_ids = [0, 1, 2];
-        assert!(build_peer_gpus(None, &gpu_device_ids).is_empty());
-    }
-
-    #[test]
-    fn test_gpus_from_registry_populates_peer_gpus() {
-        let mut reg = DeviceRegistry::new();
-        let gres_cache = GresCache::from_entries(&[GresEntry {
-            name: "gpu".into(),
-            file: Some("/dev/dri/renderD[128-130]".into()),
-            links: Some("-1,4,4,0".into()),
-            flags: vec!["amd_gpu_env".into()],
-            ..Default::default()
-        }]);
-        reg.populate(&CdiCache::new(), &gres_cache);
-
-        let gpus = gpus_from_registry(&reg);
-        assert_eq!(gpus.len(), 3);
-        for gpu in &gpus {
-            assert_eq!(gpu.peer_gpus, vec![1, 2]);
-        }
-    }
-
-    #[test]
-    fn test_gpus_from_registry_link_type_inferred_from_gres_links() {
-        let mut reg = DeviceRegistry::new();
-        let gres_cache = GresCache::from_entries(&[GresEntry {
-            name: "gpu".into(),
-            file: Some("/dev/dri/renderD[128-129]".into()),
-            links: Some("-1,4,4,0".into()),
-            flags: vec!["amd_gpu_env".into()],
-            ..Default::default()
-        }]);
-        reg.populate(&CdiCache::new(), &gres_cache);
-
-        let gpus = gpus_from_registry(&reg);
-        assert_eq!(gpus.len(), 2);
-        assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
-        assert_eq!(gpus[1].link_type, GpuLinkType::XGMI);
     }
 
     #[test]
@@ -3212,21 +3065,19 @@ mod tests {
     #[test]
     fn classify_detects_free_growth_and_allocated_loss() {
         use std::collections::HashSet;
-        let g = |d: u32, s: u64| GpuResource {
-            device_id: d,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
+        let g = |d: u32, s: u64| Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id: s,
+            index: d,
+            topology: None,
         };
-        let rs = |gpus: Vec<GpuResource>| ResourceSet {
+        let rs = |gpus: Vec<Device>| ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
-            gpus,
+            devices: gpus,
             generic: Default::default(),
             generation: 0,
             topology: None,
@@ -3258,25 +3109,23 @@ mod tests {
         );
     }
 
-    fn gpu(device_id: u32, stable_id: u64) -> GpuResource {
-        GpuResource {
-            device_id,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: GpuLinkType::XGMI,
-            topology: None,
+    fn gpu(device_id: u32, stable_id: u64) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id,
+            index: device_id,
+            topology: None,
         }
     }
 
-    fn rset(cpus: u32, generation: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+    fn rset(cpus: u32, generation: u64, gpus: Vec<Device>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
             block_file_revision: None,
             cpus,
             memory_mb: 1024,
-            gpus,
+            devices: gpus,
             generic: Default::default(),
             generation,
             topology: None,
@@ -3319,8 +3168,8 @@ mod tests {
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
 
         // Held device pinned back AND the fresh free devices kept; total ⊇ allocated.
-        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
-        assert_eq!(reconciled.gpus.len(), 3);
+        let ids: Vec<u64> = reconciled.gpus().map(|g| g.stable_id).collect();
+        assert_eq!(reconciled.gpus().count(), 3);
         assert!(ids.contains(&sid(5, 0)), "held device must be pinned");
         assert!(ids.contains(&sid(7, 0)) && ids.contains(&sid(9, 0)));
         // generation is taken from fresh, not baseline.
@@ -3344,7 +3193,7 @@ mod tests {
 
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
 
-        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: Vec<u64> = reconciled.gpus().map(|g| g.stable_id).collect();
         assert!(ids.contains(&sid(5, 0)), "held device stays advertised");
         assert!(
             !ids.contains(&sid(5, 1)),
@@ -3354,7 +3203,7 @@ mod tests {
             ids.contains(&sid(7, 0)),
             "an unrelated free GPU still flows through"
         );
-        assert_eq!(reconciled.gpus.len(), 2);
+        assert_eq!(reconciled.gpus().count(), 2);
         // No BDF-5 device other than the pinned held one is present.
         let bdf5 = ids.iter().filter(|&&id| id & 0xFF_0000 == 5 << 16).count();
         assert_eq!(bdf5, 1);
@@ -3371,8 +3220,8 @@ mod tests {
         let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
 
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
-        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
-        assert_eq!(reconciled.gpus.len(), 2);
+        let ids: Vec<u64> = reconciled.gpus().map(|g| g.stable_id).collect();
+        assert_eq!(reconciled.gpus().count(), 2);
         assert!(ids.contains(&sid(5, 0)) && ids.contains(&sid(9, 0)));
         assert!(
             !ids.contains(&sid(7, 0)),
@@ -3390,10 +3239,9 @@ mod tests {
         let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
 
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
-        assert_eq!(reconciled.gpus.len(), 2);
+        assert_eq!(reconciled.gpus().count(), 2);
         let count_held = reconciled
-            .gpus
-            .iter()
+            .gpus()
             .filter(|g| g.stable_id == sid(5, 0))
             .count();
         assert_eq!(count_held, 1);
@@ -3422,7 +3270,7 @@ mod tests {
 
     /// One MI300X in CPX (bus 0x11, ranks 0..7) beside one SPX GPU (bus 0x12).
     fn cpx_node(generation: u64) -> ResourceSet {
-        let mut gpus: Vec<GpuResource> = (0..8).map(|r| gpu(r, sid(0x11, r as u64))).collect();
+        let mut gpus: Vec<Device> = (0..8).map(|r| gpu(r, sid(0x11, r as u64))).collect();
         gpus.push(gpu(8, sid(0x12, 0)));
         rset(8, generation, gpus)
     }
@@ -3447,7 +3295,7 @@ mod tests {
         use std::collections::HashSet;
         let baseline = cpx_node(1);
         let mut fresh = cpx_node(2);
-        fresh.gpus.retain(|g| g.stable_id != sid(0x12, 0));
+        fresh.devices.retain(|g| g.stable_id != sid(0x12, 0));
         let held: HashSet<u64> = [sid(0x11, 0)].into_iter().collect();
 
         let delta = classify(&baseline, &fresh, &held);
@@ -3471,7 +3319,7 @@ mod tests {
         // The upgrade case: the baseline carries the old encoding, where the
         // rank sat in the function bits, so rank 1 has its own BDF anchor.
         let old_rank1 = (0x11 << 16) | (1 << 8);
-        let mut legacy: Vec<GpuResource> = (0..8)
+        let mut legacy: Vec<Device> = (0..8)
             .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
             .collect();
         legacy.push(gpu(8, sid(0x12, 0)));
@@ -3486,11 +3334,11 @@ mod tests {
             classify(&plan.baseline, &fresh, &plan.held),
             InventoryDelta::FreeCapacityChanged
         );
-        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus.len(), 9);
+        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus().count(), 9);
     }
 
     fn layout_node(partitions: u64) -> ResourceSet {
-        let mut gpus: Vec<GpuResource> = (0..partitions)
+        let mut gpus: Vec<Device> = (0..partitions)
             .map(|r| gpu(r as u32, sid(0x11, r)))
             .collect();
         gpus.push(gpu(partitions as u32, sid(0x12, 0)));
@@ -3527,8 +3375,7 @@ mod tests {
                     let held: HashSet<u64> = [sid(0x11, p)].into();
                     let reported = refresh_once(&old, &fresh, &held);
                     let offered: Vec<u64> = reported
-                        .gpus
-                        .iter()
+                        .gpus()
                         .map(|g| g.stable_id)
                         .filter(|id| !held.contains(id) && id >> 16 == 0x11)
                         .collect();
@@ -3539,10 +3386,10 @@ mod tests {
                         );
                     }
                     assert!(
-                        reported.gpus.iter().any(|g| g.stable_id == sid(0x11, p)),
+                        reported.gpus().any(|g| g.stable_id == sid(0x11, p)),
                         "{a}->{b}: held device must stay reported"
                     );
-                    assert!(reported.gpus.iter().any(|g| g.stable_id == sid(0x12, 0)));
+                    assert!(reported.gpus().any(|g| g.stable_id == sid(0x12, 0)));
                 }
             }
         }
@@ -3559,7 +3406,7 @@ mod tests {
                 classify(&old, &fresh, &held),
                 InventoryDelta::FreeCapacityChanged
             );
-            assert_eq!(refresh_once(&old, &fresh, &held).gpus, fresh.gpus);
+            assert_eq!(refresh_once(&old, &fresh, &held).devices, fresh.devices);
         }
     }
 
@@ -3567,7 +3414,7 @@ mod tests {
     fn the_legacy_encoding_renames_held_partitions_and_keeps_the_free_ones() {
         use std::collections::HashSet;
         let old_rank1 = (0x11 << 16) | (1 << 8);
-        let mut legacy: Vec<GpuResource> = (0..8)
+        let mut legacy: Vec<Device> = (0..8)
             .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
             .collect();
         legacy.push(gpu(8, sid(0x12, 0)));
@@ -3598,14 +3445,17 @@ mod tests {
             refresh_delta(&baseline, &fresh, &plan),
             InventoryDelta::FreeCapacityChanged
         );
-        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus, fresh.gpus);
+        assert_eq!(
+            refresh_once(&baseline, &fresh, &held).devices,
+            fresh.devices
+        );
     }
 
     #[test]
     fn a_legacy_held_partition_on_a_repartitioned_gpu_keeps_its_id_and_hides_the_gpu() {
         use std::collections::HashSet;
         let legacy_rank3 = (0x11 << 16) | (3 << 8);
-        let mut legacy: Vec<GpuResource> = (0..8)
+        let mut legacy: Vec<Device> = (0..8)
             .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
             .collect();
         legacy.push(gpu(8, sid(0x12, 0)));
@@ -3619,7 +3469,7 @@ mod tests {
 
         assert!(plan.renamed.is_empty());
         assert_eq!(plan.held, held);
-        let ids: Vec<u64> = reported.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: Vec<u64> = reported.gpus().map(|g| g.stable_id).collect();
         assert!(ids.contains(&legacy_rank3), "held device stays reported");
         assert!(
             !ids.iter().any(|id| id >> 16 == 0x11 && *id != legacy_rank3),
@@ -3634,7 +3484,7 @@ mod tests {
         let baseline = cpx_node(1);
         let fresh = cpx_node(2);
         let held: HashSet<u64> = [sid(0x11, 0)].into();
-        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus.len(), 9);
+        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus().count(), 9);
     }
 
     /// The refresh loop with every register acked: what the controller has,
@@ -3705,8 +3555,7 @@ mod tests {
         fn offered(&self, bus: u64) -> Vec<u64> {
             let held = self.held();
             self.reported
-                .gpus
-                .iter()
+                .gpus()
                 .map(|g| g.stable_id)
                 .filter(|id| id >> 16 == bus && !held.contains(id))
                 .collect()
@@ -3714,8 +3563,7 @@ mod tests {
 
         fn on_gpu(&self, bus: u64) -> Vec<u64> {
             self.reported
-                .gpus
-                .iter()
+                .gpus()
                 .map(|g| g.stable_id)
                 .filter(|id| id >> 16 == bus)
                 .collect()
@@ -3738,15 +3586,11 @@ mod tests {
             assert_eq!(agent.on_gpu(0x11), vec![sid(0x11, 1)]);
             assert!(agent.offered(0x11).is_empty());
         }
-        assert!(agent
-            .reported
-            .gpus
-            .iter()
-            .any(|g| g.stable_id == sid(0x12, 0)));
+        assert!(agent.reported.gpus().any(|g| g.stable_id == sid(0x12, 0)));
 
         assert!(agent.ledger.release_job(2));
         agent.tick(&dpx);
-        assert_eq!(agent.reported.gpus, dpx.gpus);
+        assert_eq!(agent.reported.devices, dpx.devices);
         assert_eq!(agent.fences, Fences::default());
     }
 
@@ -3835,7 +3679,7 @@ mod tests {
             .is_ok());
         assert!(agent.ledger.release_job(3));
         agent.tick(&dpx);
-        assert_eq!(agent.reported.gpus, dpx.gpus);
+        assert_eq!(agent.reported.devices, dpx.devices);
     }
 
     #[test]
@@ -3846,7 +3690,7 @@ mod tests {
         lifted.tick(&dpx);
         assert!(lifted.ledger.release_job(1));
         lifted.tick(&dpx);
-        assert_eq!(lifted.reported.gpus, dpx.gpus);
+        assert_eq!(lifted.reported.devices, dpx.devices);
         // DPX rank 0 reuses the id the fence pinned.
         for id in [sid(0x11, 0), sid(0x11, 1)] {
             assert!(
@@ -3878,7 +3722,7 @@ mod tests {
 
         // GPU 0x12 drops out while a launch takes it, so the apply defers.
         let mut without_0x12 = layout_node(2);
-        without_0x12.gpus.retain(|g| g.stable_id >> 16 != 0x12);
+        without_0x12.devices.retain(|g| g.stable_id >> 16 != 0x12);
         agent.tick_racing(&without_0x12, |ledger| {
             ledger
                 .allocate_for_job(3, 1, 0, 0, &[sid(0x12, 0)])
@@ -3946,7 +3790,7 @@ mod tests {
                         );
                     }
                     agent.tick(&fresh);
-                    assert_eq!(agent.reported.gpus, fresh.gpus, "{a}->{b}");
+                    assert_eq!(agent.reported.devices, fresh.devices, "{a}->{b}");
                 }
             }
         }
@@ -3965,8 +3809,7 @@ mod tests {
         let out = startup_inventory(&dpx, Some(&agent.reported), &held, &agent.fences);
         let on_gpu: Vec<u64> = out
             .reported
-            .gpus
-            .iter()
+            .gpus()
             .map(|g| g.stable_id)
             .filter(|id| id >> 16 == 0x11)
             .collect();
@@ -4013,7 +3856,7 @@ mod tests {
         assert_eq!(ledger.update_capacity(&reported), CapacityChange::Applied);
 
         let retried = refresh_once(&old, &fresh, &held(&ledger));
-        let ids: HashSet<u64> = retried.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: HashSet<u64> = retried.gpus().map(|g| g.stable_id).collect();
         assert!(ids.contains(&sid(0x11, 1)) && ids.contains(&sid(0x12, 0)));
         assert_eq!(ledger.update_capacity(&retried), CapacityChange::Applied);
     }
@@ -4124,7 +3967,7 @@ mod tests {
             block_file_revision: None,
             cpus: 4,
             memory_mb: 512,
-            gpus: vec![],
+            devices: vec![],
             generic: Default::default(),
             generation: 1,
             topology: None,
@@ -4264,7 +4107,7 @@ mod tests {
         let held: HashSet<u64> = [(0x11 << 16) | (3 << 8)].into();
         let out = startup_inventory(&fresh, None, &held, &Fences::default());
         assert_eq!(out.renamed[&((0x11 << 16) | (3 << 8))], sid(0x11, 3));
-        assert_eq!(out.reported.gpus, fresh.gpus);
+        assert_eq!(out.reported.devices, fresh.devices);
     }
 
     #[test]
@@ -4277,8 +4120,7 @@ mod tests {
             let out = startup_inventory(&fresh, Some(&baseline), &held, &Fences::default());
             let on_gpu: Vec<u64> = out
                 .reported
-                .gpus
-                .iter()
+                .gpus()
                 .map(|g| g.stable_id)
                 .filter(|id| id >> 16 == 0x11)
                 .collect();
@@ -4294,8 +4136,7 @@ mod tests {
         let out = startup_inventory(&fresh, None, &held, &Fences::default());
         let on_gpu: Vec<u64> = out
             .reported
-            .gpus
-            .iter()
+            .gpus()
             .map(|g| g.stable_id)
             .filter(|id| id >> 16 == 0x11)
             .collect();
@@ -4306,15 +4147,12 @@ mod tests {
     fn startup_without_a_baseline_keeps_the_siblings_of_an_intact_held_gpu() {
         use std::collections::HashSet;
         let mut fresh = layout_node(8);
-        fresh.gpus.retain(|g| g.stable_id != sid(0x12, 0));
-        fresh.gpus.push(gpu(9, sid(0x13, 0)));
+        fresh.devices.retain(|g| g.stable_id != sid(0x12, 0));
+        fresh.devices.push(gpu(9, sid(0x13, 0)));
         let held: HashSet<u64> = [sid(0x11, 2), sid(0x12, 0)].into();
         let out = startup_inventory(&fresh, None, &held, &Fences::default());
-        let ids: Vec<u64> = out.reported.gpus.iter().map(|g| g.stable_id).collect();
-        assert_eq!(
-            ids,
-            fresh.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>()
-        );
+        let ids: Vec<u64> = out.reported.gpus().map(|g| g.stable_id).collect();
+        assert_eq!(ids, fresh.gpus().map(|g| g.stable_id).collect::<Vec<_>>());
         assert!(out.renamed.is_empty());
     }
 
@@ -4329,8 +4167,7 @@ mod tests {
         let out = startup_inventory(&fresh, None, &held, &fences);
         let on_gpu: Vec<u64> = out
             .reported
-            .gpus
-            .iter()
+            .gpus()
             .map(|g| g.stable_id)
             .filter(|id| id >> 16 == 0x11)
             .collect();
@@ -4344,7 +4181,7 @@ mod tests {
         let mut fences = Fences::default();
         fences.pin(bdf_anchor(sid(0x11, 0)), &gpu(0, sid(0x11, 0)));
         let out = startup_inventory(&fresh, None, &Default::default(), &fences);
-        assert_eq!(out.reported.gpus, fresh.gpus);
+        assert_eq!(out.reported.devices, fresh.devices);
         assert_eq!(out.fences, Fences::default());
     }
 
@@ -4357,7 +4194,7 @@ mod tests {
             &Default::default(),
             &Fences::default(),
         );
-        assert_eq!(out.reported.gpus, fresh.gpus);
+        assert_eq!(out.reported.devices, fresh.devices);
         assert!(out.renamed.is_empty());
     }
 
@@ -4488,9 +4325,9 @@ mod tests {
         std::fs::write(dir.path().join(BASELINE_FILE), FROZEN_BASELINE_JSON).unwrap();
 
         let baseline = load_baseline(dir.path()).expect("an older baseline must load");
-        let ids: Vec<u64> = baseline.gpus.iter().map(|g| g.stable_id).collect();
+        let ids: Vec<u64> = baseline.gpus().map(|g| g.stable_id).collect();
         assert_eq!(ids, vec![0x110000, 0x120000]);
-        assert_eq!(baseline.gpus[0].gpu_type, "mi300x");
+        assert_eq!(baseline.devices[0].device_type, "mi300x");
         assert_eq!(baseline.generation, 5);
         assert_eq!(baseline.generic.get("bandwidth:lustre"), Some(&4096));
     }

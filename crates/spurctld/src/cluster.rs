@@ -2736,8 +2736,7 @@ impl ClusterManager {
                 for id in allocation.device_ids("gpu") {
                     let gpu = node
                         .total_resources
-                        .gpus
-                        .iter()
+                        .gpus()
                         .find(|g| g.stable_id == id)
                         .ok_or_else(|| anyhow::anyhow!("GPU disappeared"))?;
                     anyhow::ensure!(
@@ -10072,11 +10071,10 @@ impl ClusterManager {
                     resources.backfill_stable_ids();
                     let old: Vec<u64> = node
                         .detected_resources
-                        .gpus
-                        .iter()
+                        .gpus()
                         .map(|g| g.stable_id)
                         .collect();
-                    let new: Vec<u64> = resources.gpus.iter().map(|g| g.stable_id).collect();
+                    let new: Vec<u64> = resources.gpus().map(|g| g.stable_id).collect();
                     // Jobs on a repartitioned GPU keep their ids; the orphan
                     // guard withholds it.
                     let renamed = spur_core::gpu_identity::diff_layout(&old, &new).safe_renames();
@@ -11366,13 +11364,12 @@ fn node_tres_capacity(resources: &ResourceSet, key: &str) -> u64 {
     match key {
         TRES_CPU => u64::from(resources.cpus),
         TRES_MEM => resources.memory_mb,
-        TRES_GPU => resources.gpus.len() as u64,
+        TRES_GPU => resources.gpus().count() as u64,
         _ => {
             let ty = tres_key_gpu_type(key);
             resources
-                .gpus
-                .iter()
-                .filter(|gpu| Some(gpu.gpu_type.as_str()) == ty)
+                .gpus()
+                .filter(|gpu| Some(gpu.device_type.as_str()) == ty)
                 .count() as u64
         }
     }
@@ -13337,6 +13334,7 @@ fn preemption_checkpoint_saved(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use spur_core::device::Device;
     use std::sync::Arc;
 
     use super::*;
@@ -13948,7 +13946,7 @@ nodes = "ALL"
                     memory_mb: 16000,
                     generation: 7,
                     fabric_binding_version: 1,
-                    gpus: vec![gpu],
+                    devices: vec![gpu],
                     ..Default::default()
                 },
                 "127.0.0.1".into(),
@@ -14002,7 +14000,7 @@ nodes = "ALL"
             let mut nodes = cm.nodes.write();
             let inventory = &mut nodes.get_mut("n0").unwrap().total_resources;
             inventory.generation = generation;
-            inventory.gpus[0].topology = Some(topology);
+            inventory.devices[0].topology = Some(topology);
         };
         set_own(observed("1", &["1"]), 9);
         assert!(placement().is_err());
@@ -14054,7 +14052,7 @@ state = "UP"
                     generation: 7,
                     fabric_binding_version: 2,
                     block_file_revision: Some(revision.clone()),
-                    gpus: vec![gpu_resource(0, 42)],
+                    devices: vec![gpu_resource(0, 42)],
                     ..Default::default()
                 },
                 "127.0.0.1".into(),
@@ -14098,16 +14096,27 @@ state = "UP"
         }
         cm.validate_step_bindings(&job, &job.allocated_nodes)
             .unwrap();
-        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology =
-            Some(spur_core::resource::DeviceTopology {
-                fabric: Some(spur_core::fabric::FabricObservation::default()),
-                ..Default::default()
-            });
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .unwrap()
+            .total_resources
+            .devices[0]
+            .topology = Some(spur_core::resource::DeviceTopology {
+            fabric: Some(spur_core::fabric::FabricObservation::default()),
+            ..Default::default()
+        });
         cm.validate_step_bindings(&job, &["n0".into()]).unwrap();
         assert!(cm
             .validate_step_bindings(&job, &job.allocated_nodes)
             .is_err());
-        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology = None;
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .unwrap()
+            .total_resources
+            .devices[0]
+            .topology = None;
         std::fs::write(&block_path, "BlockName=a Nodes=n0,n1\nBlockName=c Nodes=n2").unwrap();
         cm.reconfigure().unwrap();
         cm.validate_step_bindings(&job, &job.allocated_nodes)
@@ -14145,7 +14154,7 @@ nodes = "ALL"
                     memory_mb: 16000,
                     generation: 7,
                     fabric_binding_version: 2,
-                    gpus: vec![gpu_resource(0, 42)],
+                    devices: vec![gpu_resource(0, 42)],
                     ..Default::default()
                 },
                 "127.0.0.1".into(),
@@ -14210,13 +14219,11 @@ state = "UP"
                 memory_mb: 1024,
                 generation: 7,
                 fabric_binding_version: 1,
-                gpus: vec![spur_core::resource::GpuResource {
-                    device_id: 0,
+                devices: vec![Device {
+                    gres_name: "gpu".into(),
+                    device_type: "test".into(),
                     stable_id: 42,
-                    gpu_type: "test".into(),
-                    memory_mb: 100,
-                    peer_gpus: vec![],
-                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                    index: 0,
                     topology: Some(spur_core::resource::DeviceTopology {
                         pci_bdf: Some("0001:04:00.0".into()),
                         fabric: Some(spur_core::fabric::FabricObservation {
@@ -14293,8 +14300,8 @@ state = "UP"
         let mut declared = native.clone();
         declared.name = "n1".into();
         declared.total_resources.fabric_binding_version = 2;
-        declared.total_resources.gpus[0].topology = None;
-        native.total_resources.gpus[0]
+        declared.total_resources.devices[0].topology = None;
+        native.total_resources.devices[0]
             .topology
             .as_mut()
             .unwrap()
@@ -16610,7 +16617,7 @@ state = "UP"
         let inventory = ResourceSet {
             generation: 7,
             fabric_binding_version: 3,
-            gpus: vec![gpu],
+            devices: vec![gpu],
             ..Default::default()
         };
         let mut allocations = HashMap::new();
@@ -16684,30 +16691,24 @@ state = "UP"
         assert!(!cm.get_job(1).unwrap().holds_a_placement());
     }
 
-    fn gpu_resource(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
-        spur_core::resource::GpuResource {
-            device_id,
-            gpu_type: "mi300x".into(),
-            memory_mb: 0,
-            peer_gpus: vec![],
-            link_type: spur_core::resource::GpuLinkType::XGMI,
-            topology: None,
+    fn gpu_resource(device_id: u32, stable_id: u64) -> Device {
+        Device {
+            gres_name: "gpu".into(),
+            device_type: "mi300x".into(),
             stable_id,
+            index: device_id,
+            topology: None,
         }
     }
 
-    fn register_gpu_node(
-        cm: &ClusterManager,
-        name: &str,
-        gpus: Vec<spur_core::resource::GpuResource>,
-    ) {
+    fn register_gpu_node(cm: &ClusterManager, name: &str, gpus: Vec<Device>) {
         cm.register_node(
             name.into(),
             name.into(),
             ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
-                gpus,
+                devices: gpus,
                 ..Default::default()
             },
             "127.0.0.1".into(),
@@ -16828,7 +16829,7 @@ state = "UP"
         ResourceSet {
             cpus: 8,
             memory_mb: 16000,
-            gpus: ids
+            devices: ids
                 .iter()
                 .enumerate()
                 .map(|(i, &sid)| gpu_resource(i as u32, sid))

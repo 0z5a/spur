@@ -2485,8 +2485,9 @@ converges to hardware changes without an agent restart — see
      - File-based or countable GRES pools; see below.
 
 Each ``[[devices.gres]]`` entry uses Slurm GRES syntax with fields ``name``
-(required), ``type``, ``file``, ``multiple_files``, ``count``, ``cores``, ``links``,
-and ``flags`` ([string]). Examples:
+(required), ``type``, ``file``, ``multiple_files``, ``count``, and ``flags``
+([string]). ``cores`` and ``links`` are accepted for Slurm compatibility but
+have no effect. Examples:
 
 .. code-block:: toml
 

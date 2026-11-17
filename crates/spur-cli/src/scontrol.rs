@@ -764,14 +764,14 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     total.map(|r| r.memory_mb).unwrap_or(0),
                     node.free_memory_mb,
                 );
-                let gpus = total.map(|r| r.gpus.len()).unwrap_or(0);
-                if gpus > 0 {
-                    let gpu_types: Vec<String> = total
-                        .unwrap()
-                        .gpus
-                        .iter()
-                        .map(|g| format!("gpu:{}:1", g.gpu_type))
-                        .collect();
+                let gpu_types: Vec<String> = total
+                    .map(|r| r.devices.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|d| d.gres_name == "gpu")
+                    .map(|g| format!("gpu:{}:1", g.device_type))
+                    .collect();
+                if !gpu_types.is_empty() {
                     println!("   Gres={}", gpu_types.join(","));
                 }
                 if let Some(resources) = total {
@@ -782,7 +782,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     if let Some(revision) = &resources.block_file_revision {
                         println!("   BlockFileRevision={revision}");
                     }
-                    for gpu in &resources.gpus {
+                    for gpu in resources.devices.iter().filter(|d| d.gres_name == "gpu") {
                         print!("{}", format_gpu_topology(gpu));
                     }
                 }
@@ -1189,7 +1189,7 @@ fn state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
-fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
+fn format_gpu_topology(gpu: &spur_proto::proto::Device) -> String {
     use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
     let Some(topology) = &gpu.topology else {
         return String::new();
@@ -1197,7 +1197,7 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
     let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
     let mut output = format!(
         "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}\n",
-        gpu.device_id,
+        gpu.index,
         gpu.stable_id,
         text(topology.pci_bdf.as_deref()),
         text(topology.pci_root.as_deref()),
@@ -1207,7 +1207,7 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
         topology
             .vram_bytes
             .map_or_else(|| "unknown".into(), |v| v.to_string()),
-        gpu.gpu_type.escape_debug(),
+        gpu.device_type.escape_debug(),
     );
     let Some(fabric) = &topology.fabric else {
         return output;
@@ -2819,7 +2819,8 @@ mod tests {
     #[test]
     fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
         use spur_proto::proto::*;
-        let gpu = GpuResource {
+        let gpu = Device {
+            gres_name: "gpu".into(),
             stable_id: 128,
             topology: Some(DeviceTopology {
                 pci_bdf: Some("0001:04:00.0".into()),
@@ -2846,7 +2847,7 @@ mod tests {
             .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
         assert!(detail.contains("ActiveEndpoints=[60,61]"));
         assert!(detail.contains("ObservationIssues=vpod_id:missing"));
-        assert!(super::format_gpu_topology(&GpuResource::default()).is_empty());
+        assert!(super::format_gpu_topology(&Device::default()).is_empty());
     }
 
     use super::*;

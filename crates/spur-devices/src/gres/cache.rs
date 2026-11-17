@@ -3,7 +3,6 @@
 
 use tracing::warn;
 
-use crate::cdi::annotations;
 use crate::cdi::spec::ContainerEdits;
 use crate::gres::entry::{
     build_device_edits, build_shared_edits, expand_hostlist, expand_multiple_files,
@@ -23,7 +22,6 @@ pub struct ExpandedGresDevice {
     pub resource_type: Option<String>,
     pub vendor: Option<String>,
     pub inject_actions: InjectActions,
-    pub links: Option<Vec<i32>>,
     pub device_edits: ContainerEdits,
     pub shared_edits: ContainerEdits,
 }
@@ -105,10 +103,6 @@ fn build_expanded_device(gres: &GresEntry, paths: &[String]) -> Option<ExpandedG
         resource_type: gres.r#type.clone(),
         vendor: infer_vendor_from_paths(paths),
         inject_actions: inject_actions_for_gres(&gres_flags, paths),
-        links: gres
-            .links
-            .as_ref()
-            .and_then(|s| annotations::parse_links(s)),
         device_edits,
         shared_edits,
     })
