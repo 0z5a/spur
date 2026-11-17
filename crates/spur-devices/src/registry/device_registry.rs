@@ -162,6 +162,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         shared_edits: expanded.shared_edits.clone(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
     }
 }
 
@@ -180,6 +181,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         shared_edits: Default::default(),
         topology: None,
         stable_id: 0,
+        rdma_device: None,
     }
 }
 

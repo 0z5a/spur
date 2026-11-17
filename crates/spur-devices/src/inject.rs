@@ -465,6 +465,7 @@ mod tests {
             shared_edits: ContainerEdits::default(),
             topology: None,
             stable_id: 0,
+            rdma_device: None,
         }
     }
 
