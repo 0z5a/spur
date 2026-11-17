@@ -5635,7 +5635,7 @@ pub(crate) mod tests {
     fn request_per_node(
         nodes: &[String],
         totals: &HashMap<String, ResourceSet>,
-        request: &ResourceSet,
+        request: &spur_core::resource::ResourceRequest,
     ) -> HashMap<String, ResourceAllocations> {
         nodes
             .iter()

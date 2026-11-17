@@ -16767,16 +16767,8 @@ state = "UP"
 
         // The stale positional ids match no live stable_id; the real GPUs must
         // not read free.
-        let want_two_gpus = ResourceSet {
-            fabric_binding_version: 0,
-            block_file_revision: None,
-            cpus: 0,
-            memory_mb: 0,
-            gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
-            generic: Default::default(),
-            generation: 0,
-            topology: None,
-        };
+        let mut want_two_gpus = spur_core::resource::ResourceRequest::default();
+        want_two_gpus.add_devices("gpu", Some("mi300x"), 2);
         {
             let node = cm.get_node("n1").unwrap();
             assert!(

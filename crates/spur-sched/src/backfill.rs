@@ -13,7 +13,7 @@ use spur_core::partition::Partition;
 use spur_core::partition_limits::{even_node_gpus, node_cpu_counts, node_memory_mb};
 use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{
-    build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
+    build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceRequest,
 };
 
 use crate::node_match::NodePlacement;
@@ -407,7 +407,7 @@ impl BackfillScheduler {
         &self,
         ni: usize,
         res_check: ReservationCheck<'_>,
-        request: &ResourceSet,
+        request: &ResourceRequest,
         cap: Option<CapCheck<'_>>,
         duration: chrono::Duration,
         floor: chrono::DateTime<Utc>,
@@ -502,10 +502,10 @@ impl BackfillScheduler {
             let mut req = base.clone();
             req.cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
             req.memory_mb = node_memory_mb(&job.spec, u64::from(req.cpus), u64::from(gpus));
-            req.gpus = placeholder_gpus(gpus, gpu_type);
+            req.set_devices("gpu", gpu_type, gpus);
             req
         };
-        let fits = |ni: usize, req: &ResourceSet| {
+        let fits = |ni: usize, req: &ResourceRequest| {
             let current = self.timelines[ni].accumulated_at(at_time);
             nodes[ni]
                 .total_resources
@@ -568,7 +568,7 @@ impl BackfillScheduler {
     fn scope_admits(
         &self,
         ni: usize,
-        req: &ResourceSet,
+        req: &ResourceRequest,
         scope: Option<PartitionScope<'_>>,
         start: chrono::DateTime<Utc>,
         duration: chrono::Duration,
@@ -1531,11 +1531,11 @@ impl BackfillScheduler {
         let heterogeneous = !job.spec.exclusive
             && (homogeneous_per_node(&demand).is_none() || cpu_is_heterogeneous(job));
 
-        let timing_request = |ni: usize| -> &ResourceSet {
+        let timing_request = |ni: usize| -> std::borrow::Cow<'_, ResourceRequest> {
             if job.spec.exclusive {
-                &cluster.nodes[ni].total_resources
+                std::borrow::Cow::Owned(cluster.nodes[ni].total_resources.as_request())
             } else {
-                &required
+                std::borrow::Cow::Borrowed(&required)
             }
         };
 
@@ -1555,7 +1555,7 @@ impl BackfillScheduler {
                 let start = self.earliest_valid_start(
                     ni,
                     res_check,
-                    timing_request(ni),
+                    &timing_request(ni),
                     cap_for(ni),
                     duration,
                     floor,
@@ -1688,7 +1688,7 @@ impl BackfillScheduler {
                     self.earliest_valid_start(
                         ni,
                         res_check,
-                        timing_request(ni),
+                        &timing_request(ni),
                         cap_for(ni),
                         duration,
                         earliest,
@@ -1762,7 +1762,7 @@ fn in_partition(node: &Node, partition: &Partition) -> bool {
 /// exclusive job holds the whole node, so it is charged the whole node.
 pub fn placement_charge(
     job: &Job,
-    required: &ResourceSet,
+    required: &ResourceRequest,
     node: &Node,
     typed_gpu: Option<&str>,
 ) -> TresCharge {
@@ -1793,7 +1793,7 @@ fn planned_adjustment(
 /// evenly spread): a cap that cannot hold this can never hold the job.
 pub fn least_fullest_node_charge(
     job: &Job,
-    required: &ResourceSet,
+    required: &ResourceRequest,
     node: &Node,
     typed_gpu: Option<&str>,
 ) -> TresCharge {
@@ -1834,7 +1834,7 @@ impl Scheduler for BackfillScheduler {
 /// Per-node CPU, memory, and non-GPU generic resources a job requests. GPUs
 /// are modeled separately (see [`resolve_gpu_demand`]) so total-vs-per-node
 /// semantics are preserved.
-pub fn base_node_request(job: &Job) -> ResourceSet {
+pub fn base_node_request(job: &Job) -> ResourceRequest {
     // Minimum per-node CPU share for feasibility filtering; exact per-node
     // counts are resolved at allocation. Floors at one CPU.
     let cpus = match job.spec.tasks_per_node {
@@ -1843,56 +1843,20 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
     }
     .max(1);
 
-    let memory = node_memory_mb(&job.spec, u64::from(cpus), 0);
-
-    let mut generic = HashMap::new();
+    let mut request =
+        ResourceRequest::with_scalar(cpus, node_memory_mb(&job.spec, u64::from(cpus), 0));
     for gres in &job.spec.gres {
-        if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
-            if name == "gpu" {
-                // GPUs are handled via the resolved GpuDemand, not as generic.
-                continue;
-            } else if name == "license" {
-                // Cluster-wide licenses are enforced in spurctld (license_pool +
-                // extract_license_requirements), not per-node generic GRES. Putting
-                // them here would require every candidate node to carry license capacity.
-                continue;
-            } else {
-                let key = match gtype {
-                    Some(t) => format!("{}:{}", name, t),
-                    None => name,
-                };
-                *generic.entry(key).or_insert(0) += count as u64;
-            }
+        let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) else {
+            continue;
+        };
+        // GPUs come from the resolved GpuDemand. Licenses are cluster-wide,
+        // enforced in spurctld, so no node needs to carry license capacity.
+        if name == "gpu" || name == "license" {
+            continue;
         }
+        request.add_devices(&name, gtype.as_deref(), count);
     }
-
-    ResourceSet {
-        fabric_binding_version: 0,
-        block_file_revision: None,
-        cpus,
-        memory_mb: memory,
-        gpus: Vec::new(),
-        generic,
-        generation: 0,
-        topology: None,
-    }
-}
-
-/// Placeholder GPU list of `count` devices of an optional type, used to probe
-/// node capacity via [`ResourceSet::can_satisfy`] and build allocations.
-fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resource::GpuResource> {
-    let ty = gpu_type.unwrap_or("any");
-    (0..count)
-        .map(|i| spur_core::resource::GpuResource {
-            device_id: i,
-            gpu_type: ty.to_string(),
-            memory_mb: 0,
-            peer_gpus: Vec::new(),
-            link_type: spur_core::resource::GpuLinkType::PCIe,
-            topology: None,
-            stable_id: 0,
-        })
-        .collect()
+    request
 }
 
 /// If every node needs the same GPU count, return it (homogeneous fast path);
@@ -1923,15 +1887,15 @@ fn cpu_is_heterogeneous(job: &Job) -> bool {
 /// earliest-start computation. For homogeneous demand this carries the exact
 /// per-node GPU count; for heterogeneous demand it carries the minimum (one
 /// GPU per node), with the concrete per-node counts resolved at allocation.
-pub fn job_resource_request(job: &Job) -> ResourceSet {
-    let mut rs = base_node_request(job);
+pub fn job_resource_request(job: &Job) -> ResourceRequest {
+    let mut request = base_node_request(job);
     let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
     // Heterogeneous demand needs at least one GPU per node for feasibility;
     // homogeneous demand carries its exact per-node count.
     let per_node = homogeneous_per_node(&demand).unwrap_or(1);
-    rs.gpus = placeholder_gpus(per_node, demand.gpu_type());
-    rs.memory_mb = node_memory_mb(&job.spec, u64::from(rs.cpus), u64::from(per_node));
-    rs
+    request.set_devices("gpu", demand.gpu_type(), per_node);
+    request.memory_mb = node_memory_mb(&job.spec, u64::from(request.cpus), u64::from(per_node));
+    request
 }
 
 #[cfg(test)]
@@ -1940,7 +1904,7 @@ mod tests {
     use spur_core::job::JobSpec;
     use spur_core::node::NodeState;
     use spur_core::partition::Partition;
-    use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations};
+    use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations, ResourceSet};
     use spur_core::topology::{SwitchConfig, TopologyTree};
     use std::collections::HashSet;
 
@@ -5343,7 +5307,13 @@ mod tests {
         );
 
         let request = job_resource_request(&job);
-        assert_eq!(request.generic.get("bandwidth:lustre"), Some(&100));
+        assert_eq!(
+            request.devices.get(&spur_core::resource::DeviceKey::new(
+                "bandwidth",
+                Some("lustre")
+            )),
+            Some(&100)
+        );
     }
 
     fn cpu_request(num_nodes: u32, num_tasks: u32, cpus_per_task: u32) -> u32 {

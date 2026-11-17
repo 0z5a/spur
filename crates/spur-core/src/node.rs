@@ -489,7 +489,7 @@ impl Node {
     }
 
     /// Whether available inventory can satisfy a count-based request.
-    pub fn can_satisfy_request(&self, request: &ResourceSet) -> bool {
+    pub fn can_satisfy_request(&self, request: &crate::resource::ResourceRequest) -> bool {
         self.total_resources
             .can_satisfy_with_allocated(&self.alloc_resources, request)
     }
