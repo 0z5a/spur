@@ -621,7 +621,9 @@ async fn main() -> anyhow::Result<()> {
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
     let running_jobs = agent_server::new_running_jobs();
-    agent_server::recover_stepds(&running_jobs, recovered_stepds.clone()).await;
+    let mut adopted = recovered_stepds.clone();
+    agent_server::backfill_gpu_indices(&mut adopted, &current_gpus);
+    agent_server::recover_stepds(&running_jobs, adopted).await;
 
     // Create the node reporter
     let reporter_timeouts = reporter::ReporterTimeouts {

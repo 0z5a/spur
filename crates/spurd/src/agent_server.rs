@@ -43,13 +43,9 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
-/// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
-///
-/// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
-/// devices" so they cannot inherit the runtime's all-visible default.
-/// The devices a dispatch names that this node injects into the job: its GPUs,
-/// plus every other kind the registry holds devices for. Countable pools have
-/// nothing to inject.
+/// The devices a dispatch names, by kind. Countable pools have nothing to
+/// inject; every other kind is kept even when the registry no longer has it,
+/// so resolving its plan fails the launch instead of running without it.
 fn allocated_selection(
     allocated: Option<&ResourceAllocations>,
     registry: &DeviceRegistry,
@@ -59,13 +55,19 @@ fn allocated_selection(
         return selection;
     };
     for (gres, held) in &allocated.devices {
-        if gres == "gpu" || registry.has_injectable(gres) {
+        // Pool keys may carry a type (`name:type`); device kinds never do.
+        let is_pool = gres.contains(':') || registry.has_countable_pool(gres);
+        if gres == "gpu" || !is_pool {
             selection.set(gres, held.devices.iter().map(|d| d.device_id).collect());
         }
     }
     selection
 }
 
+/// Apply GPU-deny sentinels to a job env when no GPUs were allocated.
+///
+/// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
+/// devices" so they cannot inherit the runtime's all-visible default.
 fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
     if allocated_device_ids.is_empty() {
         spur_core::task_launch::gpu_deny_visibility(env);
@@ -720,6 +722,33 @@ pub fn startup_held_gpu_ids(
                 .unwrap_or_else(|| recorded.to_vec())
         })
         .collect()
+}
+
+/// A supervisor from an agent that predates `gpu_indices` recorded none, so
+/// its job's hooks would see no GPUs; number them from the live inventory.
+/// GPUs the inventory no longer has leave the job's list empty, as before.
+pub fn backfill_gpu_indices(
+    descriptors: &mut [crate::stepd::StepdDescriptor],
+    current_gpus: &[spur_core::device::Device],
+) {
+    for descriptor in descriptors {
+        let resources = &mut descriptor.resources;
+        if !resources.gpu_indices.is_empty() {
+            continue;
+        }
+        let indices: Option<Vec<u32>> = resources
+            .devices
+            .gpus()
+            .iter()
+            .map(|id| {
+                current_gpus
+                    .iter()
+                    .find(|g| g.stable_id == *id)
+                    .map(|g| g.index)
+            })
+            .collect();
+        resources.gpu_indices = indices.unwrap_or_default();
+    }
 }
 
 fn renamed_gpu_ids(recorded: &[u64], renamed: &HashMap<u64, u64>) -> Vec<u64> {
@@ -16736,6 +16765,37 @@ mod tests {
         (spec, allocated)
     }
 
+    #[test]
+    fn hooks_of_a_job_from_an_older_agent_still_see_its_gpus() {
+        let mut older = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            0,
+            0,
+            0,
+            std::path::PathBuf::from("/run/spur/7.sock"),
+            std::path::PathBuf::new(),
+        );
+        older.resources.devices.set("gpu", vec![0x120000]);
+        let mut current = older.clone();
+        current.resources.devices.set("gpu", vec![0x110000]);
+        current.resources.gpu_indices = vec![5];
+        let mut lost = older.clone();
+        lost.resources.devices.set("gpu", vec![0x990000]);
+        let inventory = [
+            spur_core::device::Device::gpu(0x110000, "mi300x", 0),
+            spur_core::device::Device::gpu(0x120000, "mi300x", 1),
+        ];
+
+        let mut descriptors = vec![older, current, lost];
+        backfill_gpu_indices(&mut descriptors, &inventory);
+        let indices: Vec<&[u32]> = descriptors
+            .iter()
+            .map(|d| d.resources.gpu_indices.as_slice())
+            .collect();
+        assert_eq!(indices, [&[1][..], &[5][..], &[][..]]);
+    }
+
     #[tokio::test]
     async fn a_dispatch_naming_a_nic_another_job_holds_is_refused() {
         let svc = AgentService::new(
@@ -16810,6 +16870,45 @@ mod tests {
                 .with("gpu", vec![0])
                 .with("nic", vec![1])
         );
+    }
+
+    #[test]
+    fn a_device_kind_this_node_lost_still_reaches_the_launch() {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let mut registry = DeviceRegistry::new();
+        registry.populate(
+            &CdiCache::new(),
+            &GresCache::from_entries(&[GresEntry {
+                name: "scratch".into(),
+                count: Some(8),
+                flags: vec!["count_only".into()],
+                ..Default::default()
+            }]),
+        );
+        let held = |device_id, count| DeviceAllocations {
+            devices: vec![AllocatedDevice { device_id, count }],
+        };
+        let allocated = ResourceAllocations {
+            devices: [
+                ("nic".to_string(), held(1, 1)),
+                ("scratch".to_string(), held(0, 2)),
+                ("bandwidth:lustre".to_string(), held(0, 64)),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let selection = super::allocated_selection(Some(&allocated), &registry);
+        assert_eq!(
+            selection,
+            spur_devices::DeviceSelection::new().with("nic", vec![1]),
+            "the NIC must reach plan resolution so its absence fails the launch"
+        );
+        assert!(registry
+            .build_job_injection_plans(&selection, 0, 0)
+            .is_err());
     }
 
     fn test_gpu_registry() -> DeviceRegistry {
