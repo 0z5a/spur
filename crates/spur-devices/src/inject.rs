@@ -96,6 +96,9 @@ pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,
     pub device_paths: Vec<String>,
+    /// Positional index of each allocated GPU, the numbering the job's
+    /// visibility variables and `SPUR_JOB_GPUS` use.
+    pub gpu_indices: Vec<u32>,
 }
 
 /// Merge container edits and inject actions from resolved registry entries.
@@ -155,6 +158,7 @@ pub fn build_injection_plans(
     let gpu_ids = device_ids_for_gres(devices, "gpu");
     let mut host_plan = HostInjector::plan(&edits, &gpu_ids);
     let mut container_plan = ContainerInjector::plan(&edits, &gpu_ids, job_uid, job_gid);
+    host_plan.gpu_indices = gpu_ids;
     apply_spur_job_device_env(&mut host_plan.env, devices);
     apply_spur_job_device_env(&mut container_plan.env, devices);
     (host_plan, container_plan)
