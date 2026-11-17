@@ -27,7 +27,9 @@ pub struct HookContext {
     /// `prolog_slurmd`, `epilog_slurmd`, `prolog_slurmctld`, `epilog_slurmctld`,
     /// `prolog_task`, `epilog_task`, `prolog_srun`, `epilog_srun`.
     pub script_context: String,
-    pub gpu_devices: Vec<u64>,
+    /// Positional GPU indices, the numbering of the job's `SPUR_JOB_GPUS`
+    /// and vendor visibility variables, never stable ids.
+    pub gpu_indices: Vec<u32>,
     pub cpus: u32,
     pub memory_mb: u64,
 }
@@ -39,7 +41,7 @@ impl HookContext {
     pub fn environment(&self) -> std::collections::HashMap<String, String> {
         let username = resolve_username(self.uid);
         let gpu_list: String = self
-            .gpu_devices
+            .gpu_indices
             .iter()
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
@@ -881,10 +883,22 @@ mod tests {
             partition: "gpu".into(),
             nodelist: "node01".into(),
             script_context: "prolog_slurmd".into(),
-            gpu_devices: vec![0, 1],
+            gpu_indices: vec![0, 1],
             cpus: 8,
             memory_mb: 16384,
         }
+    }
+
+    #[test]
+    fn hooks_see_the_positional_gpu_indices_the_job_sees() {
+        let ctx = HookContext {
+            gpu_indices: vec![2, 5],
+            ..test_ctx()
+        };
+        assert_eq!(
+            ctx.environment().get("SPUR_JOB_GPUS").map(String::as_str),
+            Some("2,5")
+        );
     }
 
     #[tokio::test]

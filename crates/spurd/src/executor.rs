@@ -132,6 +132,12 @@ pub fn is_root_trusted_dir(owner_uid: u32, mode: u32) -> bool {
     owner_uid == 0 && mode & 0o022 == 0
 }
 
+/// What hooks report as the job's GPUs: the positional indices its own
+/// visibility variables use.
+pub fn hook_gpu_indices(plan: Option<&spur_devices::inject::HostInjectionPlan>) -> Vec<u32> {
+    plan.map(|p| p.gpu_indices.clone()).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
@@ -172,7 +178,7 @@ pub struct JobLaunchConfig {
     pub stdin_path: String,
     pub cpus: u32,
     pub memory_mb: u64,
-    pub gpu_devices: Vec<u64>,
+    pub devices: spur_devices::DeviceSelection,
     pub cpu_ids: Vec<u32>,
     pub open_mode: Option<String>,
     pub uid: u32,
@@ -586,7 +592,7 @@ pub async fn launch_job(
             partition: cfg.partition.clone(),
             nodelist: cfg.nodelist.clone(),
             script_context: "prolog_slurmd".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
+            gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
             cpus: cfg.cpus,
             memory_mb: cfg.memory_mb,
         };
@@ -613,7 +619,7 @@ async fn spawn_job_process(
         ref stdin_path,
         cpus,
         memory_mb,
-        gpu_devices: _,
+        devices: _,
         ref cpu_ids,
         ref open_mode,
         uid,
@@ -777,7 +783,7 @@ async fn spawn_job_process(
             partition: cfg.partition.clone(),
             nodelist: cfg.nodelist.clone(),
             script_context: "prolog_task".into(),
-            gpu_devices: cfg.gpu_devices.clone(),
+            gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
             cpus,
             memory_mb,
         };
@@ -814,7 +820,7 @@ async fn spawn_job_process(
                 partition: cfg.partition.clone(),
                 nodelist: cfg.nodelist.clone(),
                 script_context: "epilog_task".into(),
-                gpu_devices: cfg.gpu_devices.clone(),
+                gpu_indices: hook_gpu_indices(cfg.host_device_plan.as_ref()),
                 cpus,
                 memory_mb,
             };
@@ -4421,7 +4427,7 @@ mod tests {
             stdin_path: String::new(),
             cpus: 1,
             memory_mb: 0,
-            gpu_devices: Vec::new(),
+            devices: spur_devices::DeviceSelection::new().with("gpu", Vec::new()),
             cpu_ids: Vec::new(),
             open_mode: None,
             uid: 0,

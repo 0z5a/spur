@@ -106,17 +106,12 @@ path.
 
    EXPORT_DIR="/var/run/exporter"
 
-   # AMD GPU render-node minor numbers start at 128, while SPUR_JOB_GPUS
-   # reports the 0-based logical device index Spur schedules against.
+   # SPUR_JOB_GPUS lists the job's 0-based GPU indices.
    IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
-   RENDER_IDS=()
-   for gpu in "${GPU_IDS[@]}"; do
-       RENDER_IDS+=("$((gpu % 128))")
-   done
-   CUDA_VISIBLE_DEVICES=$(IFS=','; echo "${RENDER_IDS[*]}")
+   CUDA_VISIBLE_DEVICES="${SPUR_JOB_GPUS}"
 
    [ -d "${EXPORT_DIR}" ] || exit 0
-   for id in "${RENDER_IDS[@]}"; do
+   for id in "${GPU_IDS[@]}"; do
        printf '{"SLURM_JOB_ID":"%s","SLURM_JOB_USER":"%s","SLURM_JOB_PARTITION":"%s","CUDA_VISIBLE_DEVICES":"%s"}' \
            "${SLURM_JOB_ID}" "${SPUR_JOB_USER}" "${SLURM_JOB_PARTITION}" "${CUDA_VISIBLE_DEVICES}" \
            > "${EXPORT_DIR}/${id}"
@@ -140,8 +135,8 @@ of writing it:
 
    IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
    [ -d "${EXPORT_DIR}" ] || exit 0
-   for gpu in "${GPU_IDS[@]}"; do
-       rm -f "${EXPORT_DIR}/$((gpu % 128))"
+   for id in "${GPU_IDS[@]}"; do
+       rm -f "${EXPORT_DIR}/${id}"
    done
 
 Running the exporter container

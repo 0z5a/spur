@@ -1170,6 +1170,11 @@ Node inventory now lists every allocatable device, of every kind, in
   ``inventory-baseline.json`` and ``inventory-fences.json`` an earlier release
   wrote. After a rollback, an older ``spurd`` ignores fences the newer one
   wrote, as it would an unreadable file.
+* **Hook ``SPUR_JOB_GPUS`` is positional.** Prolog and epilog hooks now see
+  the same 0-based GPU indices as the job's ``SPUR_JOB_GPUS`` and
+  ``ROCR_VISIBLE_DEVICES``. Earlier releases passed internal device ids
+  (render minors such as ``128``, or larger ids on partitioned GPUs). Scripts
+  that mapped those back with ``% 128`` keep working; drop the mapping.
 * **No longer used.** The ``spur.amd.com/gpu-link`` Kubernetes node label and
   the ``links`` field of ``[[devices.gres]]`` are accepted but have no effect;
   both only fed ``peer_gpus`` and ``link_type``.
