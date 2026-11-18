@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.17.0](https://github.com/ROCm/spur/compare/v0.16.0...v0.17.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurctld:** remove nodes missing from admission.node_names on reconfigure ([#1243](https://github.com/ROCm/spur/issues/1243))
+* **spurd:** give a batch job's srun --container-image step its own container ([#1172](https://github.com/ROCm/spur/issues/1172))
+* **spurd:** hold a node until its epilog finishes or times out ([#1227](https://github.com/ROCm/spur/issues/1227))
+
+### Features
+
+* **spur-cli:** add salloc --interactive-step to start the shell on the allocated node ([#1266](https://github.com/ROCm/spur/issues/1266)) ([c5a15b3](https://github.com/ROCm/spur/commit/c5a15b3d393adc7b859d07cde92738020c294d8b))
+* **spur-cli:** map scontrol node deletion to native removal ([#1244](https://github.com/ROCm/spur/issues/1244)) ([56d75c7](https://github.com/ROCm/spur/commit/56d75c7e7a012c5f2cef59113e46532fbe1ac48e))
+* **spurctld:** add per-partition resource limits on shared nodes ([#1193](https://github.com/ROCm/spur/issues/1193)) ([a6471fa](https://github.com/ROCm/spur/commit/a6471fa021d023e2362b9669b2378c11b361024e))
+* **spurctld:** keep a deleted node out until its spurd restarts ([#1286](https://github.com/ROCm/spur/issues/1286)) ([8d91060](https://github.com/ROCm/spur/commit/8d91060ee63c53c4cd23ff35c617ab1ae0261168))
+* **spurctld:** rank equal-priority victims to evict fewer jobs and lose less work ([#1146](https://github.com/ROCm/spur/issues/1146)) ([8448fe9](https://github.com/ROCm/spur/commit/8448fe9160e9063268f47c7b559cdd419ba5de58))
+* **spurctld:** remove nodes missing from admission.node_names on reconfigure ([#1243](https://github.com/ROCm/spur/issues/1243)) ([3552304](https://github.com/ROCm/spur/commit/35523045dcff73845b7f6720361c51d358f8d68b))
+* **spurctld:** track preemption outcomes with accounting reports ([#1226](https://github.com/ROCm/spur/issues/1226)) ([72fd55c](https://github.com/ROCm/spur/commit/72fd55c74777548dc2d7aa93fa0095c965206999))
+* **spurd:** enable the io controller for job cgroups ([#1256](https://github.com/ROCm/spur/issues/1256)) ([d40a237](https://github.com/ROCm/spur/commit/d40a23755fede9a747ae75c0fae65d6672c88980))
+* **steps:** let a step take its own cpu, memory, and gpu share of its allocation ([#1171](https://github.com/ROCm/spur/issues/1171)) ([45cc891](https://github.com/ROCm/spur/commit/45cc89179c7881db0415486cf31e4aedcfa208ac))
+
+
+### Bug Fixes
+
+* **deps:** require h2 &gt;= 0.4.20 ([#1289](https://github.com/ROCm/spur/issues/1289)) ([0178fea](https://github.com/ROCm/spur/commit/0178fea194339b1326b6abc460344806a9ee4209))
+* **spur-cli:** validate self-update arguments before upgrading ([#1261](https://github.com/ROCm/spur/issues/1261)) ([8a3d9ba](https://github.com/ROCm/spur/commit/8a3d9ba907262b59213eddb4c51e77229b828a77))
+* **spurctld:** confirm a node is unreachable before marking it down ([#1149](https://github.com/ROCm/spur/issues/1149)) ([f5bdc83](https://github.com/ROCm/spur/commit/f5bdc83ba35bfd9c350d0f6f18cd2c3d86123859))
+* **spurctld:** hold a returning node until its stale jobs are reclaimed ([#1150](https://github.com/ROCm/spur/issues/1150)) ([44059f2](https://github.com/ROCm/spur/commit/44059f265799c94eb89b7515bc93f434f75bd343))
+* **spurctld:** keep a preemptor's quota claim while its eviction is in flight ([#1190](https://github.com/ROCm/spur/issues/1190)) ([8af8f81](https://github.com/ROCm/spur/commit/8af8f81579ea632c5b064fa9e1dddefe8fd1acd4))
+* **spurctld:** report preemption grace end and preempt time over rest ([#1241](https://github.com/ROCm/spur/issues/1241)) ([f1f216c](https://github.com/ROCm/spur/commit/f1f216cb5fa9258587880fe80c25890b367d089e))
+* **spurd:** give a batch job's srun --container-image step its own container ([#1172](https://github.com/ROCm/spur/issues/1172)) ([47bd33f](https://github.com/ROCm/spur/commit/47bd33f9f05ba87fc3ad6916a349f96ec6a5b694))
+* **spurd:** hold a node until its epilog finishes or times out ([#1227](https://github.com/ROCm/spur/issues/1227)) ([fcdd88e](https://github.com/ROCm/spur/commit/fcdd88ec8c720e50805f15ab7122ae50feedb7b2))
+* **spurd:** keep a job from redirecting what spurd reads and writes as root ([#1269](https://github.com/ROCm/spur/issues/1269)) ([5233796](https://github.com/ROCm/spur/commit/523379650272055c542c59461c92596ee570f7e6))
+* **sshare:** keep the caller's own rows when usage is private ([#1230](https://github.com/ROCm/spur/issues/1230)) ([f201994](https://github.com/ROCm/spur/commit/f2019947fdba6a71c98c1b649dea9f27a2988b79))
+
+
+### Performance
+
+* **spurctld:** stop scanning the job table on every QOS and account limit check ([#1191](https://github.com/ROCm/spur/issues/1191)) ([397bedc](https://github.com/ROCm/spur/commit/397bedc84f2d956a0b24a8d4a1736ba4ad6518ec))
+
 ## [0.16.0](https://github.com/ROCm/spur/compare/v0.15.0...v0.16.0) (2026-11-07)
 
 
