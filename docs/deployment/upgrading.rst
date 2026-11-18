@@ -1197,6 +1197,10 @@ Node inventory now lists every allocatable device, of every kind, in
   wrote, as it would an unreadable file. Supervisors of running jobs keep
   working across the upgrade and a rollback: their state still records the
   job's GPUs in the old form.
+* **Node GRES output is aggregated.** ``Gres=`` in ``scontrol show node`` and
+  ``%G`` in ``sinfo`` print one ``name[:type]:count`` entry per device kind,
+  GPUs first, then each countable pool: ``gpu:mi300x:8`` instead of eight
+  ``gpu:mi300x:1`` entries. Scripts that count entries must read the count.
 * **File-backed GRES of any kind are schedulable.** A ``[[devices.gres]]``
   entry with ``file`` and a name other than ``gpu`` was never reported, so jobs
   requesting it could not run. It is now reported, allocated per device, and
